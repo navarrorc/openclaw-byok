@@ -6,8 +6,8 @@
 # Hetzner, Linode, or any equivalent VPS). It provisions a hardened,
 # minimal Docker host running a single vanilla OpenClaw instance using
 # YOUR OWN LLM API key. Nobody but you holds SSH access to this box
-# after it finishes (see support-access.sh for the opt-in, auto-expiring
-# way to invite us in when you want help).
+# after it finishes (see support-access.sh for the opt-in way to invite
+# us in when you want help — stays on until YOU turn it off).
 #
 # Usage:
 #   curl -fsSL <url-to-this-script> -o setup.sh
@@ -214,13 +214,23 @@ if [ -z "${GEMINI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${ANTHR
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Notification channel (optional — for the verification step)
+# 6. Telegram — this is how you'll actually talk to your assistant, not
+#    optional. Every customer needs a real chat interface on day one.
 # ---------------------------------------------------------------------------
 if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
-    read -r -p "Telegram bot token for notifications (optional, press Enter to skip): " TELEGRAM_BOT_TOKEN || true
+    echo ""
+    echo "Telegram is how you'll talk to your assistant day to day."
+    echo "1. In Telegram, message @BotFather, send /newbot, and follow the prompts."
+    echo "2. Paste the token it gives you below."
+    while [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; do
+        read -r -p "Telegram bot token: " TELEGRAM_BOT_TOKEN
+    done
 fi
-if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-    read -r -p "Telegram chat ID to notify (optional): " TELEGRAM_CHAT_ID || true
+if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+    echo "Now message @userinfobot on Telegram — it replies with your numeric ID."
+    while [ -z "${TELEGRAM_CHAT_ID:-}" ]; do
+        read -r -p "Your Telegram user ID: " TELEGRAM_CHAT_ID
+    done
 fi
 
 # ---------------------------------------------------------------------------
@@ -310,6 +320,54 @@ if [ "$STATUS" != "healthy" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 7b. Wire Telegram in as a real, live channel (not just a one-off notify).
+#     The container starts with no channels configured, so this writes the
+#     account + routing binding + plugin toggle directly into its config,
+#     then restarts once to pick it up. Confirmed working shape as of
+#     OpenClaw 2026.2.6 — bindings entries take agentId+match only, no
+#     "type" key (the doctor auto-fixer strips it if present), and the
+#     telegram plugin must be explicitly enabled or the channel is invisible
+#     to the CLI even with a valid token.
+# ---------------------------------------------------------------------------
+log "Wiring up your Telegram bot"
+docker exec openclaw node -e "
+const fs = require('fs');
+const path = '/data/.openclaw/openclaw.json';
+const cfg = JSON.parse(fs.readFileSync(path, 'utf8'));
+cfg.channels = cfg.channels || {};
+cfg.channels.telegram = cfg.channels.telegram || {};
+cfg.channels.telegram.accounts = cfg.channels.telegram.accounts || {};
+cfg.channels.telegram.accounts.main = {
+  name: 'OpenClaw',
+  enabled: true,
+  botToken: '${TELEGRAM_BOT_TOKEN}',
+  allowFrom: ['${TELEGRAM_CHAT_ID}'],
+  dmPolicy: 'allowlist'
+};
+cfg.bindings = (cfg.bindings || []).filter(b => !(b.match && b.match.channel === 'telegram' && b.match.accountId === 'main'));
+cfg.bindings.push({ agentId: 'main', match: { channel: 'telegram', accountId: 'main' } });
+cfg.plugins = cfg.plugins || {};
+cfg.plugins.entries = cfg.plugins.entries || {};
+cfg.plugins.entries.telegram = { enabled: true };
+fs.writeFileSync(path, JSON.stringify(cfg, null, 2));
+" || warn "Could not write Telegram config automatically. See CUSTOMER_SETUP_GUIDE.md's troubleshooting section."
+
+docker restart openclaw >/dev/null
+DEADLINE=$((SECONDS + 60))
+while [ "$SECONDS" -lt "$DEADLINE" ]; do
+    STATUS=$(docker inspect --format '{{.State.Health.Status}}' openclaw 2>/dev/null || echo "starting")
+    [ "$STATUS" = "healthy" ] && break
+    sleep 5
+done
+TELEGRAM_STATUS=$(docker exec openclaw openclaw channels status 2>&1 | grep -i telegram || true)
+if echo "$TELEGRAM_STATUS" | grep -qi "running"; then
+    log "Telegram is live: $TELEGRAM_STATUS"
+else
+    warn "Telegram may not be fully wired up yet: ${TELEGRAM_STATUS:-no status returned}"
+    warn "Check: docker exec openclaw openclaw channels status"
+fi
+
+# ---------------------------------------------------------------------------
 # 8. Self-healing watchdog (installed separately, see openclaw-watchdog.*)
 # ---------------------------------------------------------------------------
 if [ -f "$(dirname "$0")/install-watchdog.sh" ]; then
@@ -358,7 +416,11 @@ cat <<SUMMARY
  - Dashboard login:     user=$AUTH_USERNAME  password=$AUTH_PASSWORD
                         (saved in $OPENCLAW_DIR/.env, root-readable only)
 
- Need help later? Run support-access.sh to grant temporary,
- auto-expiring access. See CUSTOMER_SETUP_GUIDE.md.
+ Your assistant is ready to chat. Open Telegram and message your bot,
+ try sending "Hey" and it should reply within a few seconds.
+
+ Need help later? Run: sudo ./support-access.sh on
+ It stays on until YOU turn it off with: sudo ./support-access.sh off
+ See CUSTOMER_SETUP_GUIDE.md.
 =============================================================
 SUMMARY
