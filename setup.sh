@@ -320,6 +320,30 @@ if [ "$STATUS" != "healthy" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 7a. Workspace files — the container generates its OWN default AGENTS.md on
+#     first boot, and it's a good one (memory, heartbeats, safety rules).
+#     APPEND to it rather than replace it, so we only add the one thing it's
+#     missing: don't ask for info a channel already handed you (e.g.
+#     Telegram messages arrive pre-tagged with the sender's name).
+# ---------------------------------------------------------------------------
+log "Adding one instruction to the assistant's default AGENTS.md"
+cat > /tmp/openclaw-AGENTS-addendum.md <<'AGENTSMD'
+
+## Use the name you're already given
+
+Incoming messages on some channels (e.g. Telegram) are prefixed with the
+sender's name, like `[Telegram Alex id:123456789 2026-08-17 21:20 UTC] Hey`.
+That name is already known, don't ask for it. Greet the person by that name
+and save it to USER.md right away. Only ask what to call them if a channel
+genuinely gives you no name to go on, or if they tell you they'd prefer
+something else.
+AGENTSMD
+docker cp /tmp/openclaw-AGENTS-addendum.md openclaw:/tmp/agents-addendum.md
+docker exec openclaw sh -c "grep -qF 'Use the name you'\''re already given' /data/workspace/AGENTS.md 2>/dev/null || cat /tmp/agents-addendum.md >> /data/workspace/AGENTS.md"
+docker exec openclaw rm -f /tmp/agents-addendum.md
+rm -f /tmp/openclaw-AGENTS-addendum.md
+
+# ---------------------------------------------------------------------------
 # 7b. Wire Telegram in as a real, live channel (not just a one-off notify).
 #     The container starts with no channels configured, so this writes the
 #     account + routing binding + plugin toggle directly into its config,
