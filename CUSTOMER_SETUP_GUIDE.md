@@ -2,40 +2,42 @@
 
 This walks you through getting your own private OpenClaw assistant running
 on a server only you control. It takes about 15 minutes, no coding
-experience needed — you'll copy and paste a few things into a terminal.
+experience needed. You'll copy and paste a few things into a terminal.
 
-**What you're building:** a small cloud server ("droplet" or "VPS") that
-runs OpenClaw using your own AI provider account (Gemini, OpenAI, or
-Anthropic). You pay your cloud host directly for the server, and your AI
-provider directly for usage. We never see or hold either of those
-accounts — we hand you a setup script, you run it, and from that moment
-the box is yours.
+**What you're building:** a small cloud server (sometimes called a
+"droplet" or a "VPS") that runs OpenClaw using your own AI provider
+account (Gemini, OpenAI, or Anthropic). You pay your cloud host directly
+for the server, and your AI provider directly for usage. We never see or
+hold either of those accounts. We hand you a setup script, you run it,
+and from that moment the box is yours.
 
 ---
 
-## Step 1 — Create a cloud server
+## Step 1: Create a cloud server
 
 Pick one of these (any works fine, DigitalOcean is the simplest for
 first-timers):
 
-- **DigitalOcean** — [digitalocean.com](https://digitalocean.com) → "Create" → "Droplets"
-- **Hetzner** — [hetzner.com](https://hetzner.com) → "Add Server"
-- **Linode/Akamai** — [linode.com](https://linode.com) → "Create Linode"
+- **DigitalOcean**: [digitalocean.com](https://digitalocean.com) → "Create" → "Droplets"
+- **Hetzner**: [hetzner.com](https://hetzner.com) → "Add Server"
+- **Linode/Akamai**: [linode.com](https://linode.com) → "Create Linode"
 
 When creating it, choose:
 
-- **Image / OS:** Ubuntu 24.04 (LTS) — or 22.04 if that's what's offered
-- **Size:** the cheapest "Basic"/shared-CPU plan with at least **2 GB RAM**
-  is enough for a single assistant (~$12–18/month on most hosts)
-- **Authentication:** if it asks for an SSH key and you don't have one, it's
-  fine to use a password instead — you'll switch to key-only access as part
-  of setup
-- **Region:** wherever's closest to you
+- **Image / OS:** Ubuntu 26.04 (LTS). 24.04 or 22.04 also work fine if
+  that's what your host offers.
+- **Size:** the cheapest "Basic"/shared-CPU plan with at least **2 GB
+  RAM** is enough for a single assistant (roughly $12 to $18/month on
+  most hosts).
+- **Authentication:** if it asks for an SSH key and you don't have one,
+  it's fine to use a password instead. You'll switch to key-only access
+  as part of setup.
+- **Region:** wherever's closest to you.
 
 Once it's created, you'll be given a public **IP address** (four numbers
-like `104.xxx.xxx.xxx`) — you'll need that in the next step.
+like `104.xxx.xxx.xxx`). You'll need that in the next step.
 
-## Step 2 — Connect to your server
+## Step 2: Connect to your server
 
 - **Mac/Linux:** open the Terminal app
 - **Windows:** open PowerShell
@@ -46,11 +48,31 @@ Then run (replace the IP with yours):
 ssh root@104.xxx.xxx.xxx
 ```
 
-Type `yes` if asked about the server's fingerprint, then enter the
-password your cloud host gave you (or it'll just work if you used an SSH
-key).
+A couple of things will happen the first time you connect. Nothing here
+is a problem, it's just what a brand-new server does the very first time
+anyone logs in:
 
-## Step 3 — Run the setup script
+1. **A one-time trust prompt.** You'll see a short message asking if you
+   trust this server. This is completely normal for any server the very
+   first time you connect to it. Just type `yes` and press Enter.
+2. **Your starting password.** Enter the password your cloud host gave
+   you when the server was created (check your email or the server's page
+   in your host's dashboard). If you set up an SSH key instead when
+   creating the server, you won't see a password prompt at all, just skip
+   ahead to Step 3.
+3. **A password reset.** Many hosts ask you to pick a new password the
+   moment you first log in, as a security precaution. If prompted, type
+   your current password once more, then type a new password twice. Pick
+   something you'll remember.
+4. **A quick reconnect.** After you set the new password, you'll be
+   dropped back out to your own computer. That's expected, not an error.
+   Just log in again the same way, using your new password this time:
+   ```
+   ssh root@104.xxx.xxx.xxx
+   ```
+   This time you'll land right in.
+
+## Step 3: Run the setup script
 
 Once connected, paste this:
 
@@ -64,32 +86,33 @@ chmod +x setup.sh install-watchdog.sh
 The script will ask you a few questions:
 
 1. **Your SSH public key** (only if one wasn't already set up when you
-   created the droplet) — this is so you can still log back in after the
-   script locks down password logins for security.
+   created the droplet). This makes sure you can still log back in after
+   the script locks down password logins for security.
 2. **Which AI provider you're using** (Gemini, OpenAI, or Anthropic) and
-   **your API key** for it. Get a key from:
+   **your API key** for it. You can get a key from:
    - Gemini: [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
    - OpenAI: [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
    - Anthropic: [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)
-3. **A Telegram bot token** (optional) — if you want a message confirming
-   setup succeeded, sent straight to you. Safe to skip.
+3. **A Telegram bot token** (optional). If you want a message confirming
+   setup succeeded sent straight to you, add one here. Totally fine to
+   skip this.
 
-It takes 3–5 minutes to finish. Along the way it:
+It takes 3 to 5 minutes to finish. Along the way it will:
 
-- Creates a dedicated user account and locks down SSH to key-only login
-- Turns on a firewall and basic intrusion protection
-- Installs Docker and starts your OpenClaw assistant
-- Installs a small watchdog that restarts it automatically if it ever
-  crashes (and can optionally auto-update itself — off by default, see
-  below)
-- Runs a real test message through your assistant to confirm everything
-  is wired up correctly, and prints (and optionally Telegrams you) the
-  result
+- Create a dedicated user account and lock down SSH to key-only login
+- Turn on a firewall and basic intrusion protection
+- Install Docker and start your OpenClaw assistant
+- Install a small watchdog that restarts your assistant automatically if
+  it ever crashes (it can also auto-update itself, though that's off by
+  default, see below)
+- Send a real test message through your assistant to confirm everything
+  is wired up correctly, and show you the result (and Telegram it to you
+  too, if you added a bot token)
 
 When it finishes, you'll see a summary with your dashboard login. **Save
-that password somewhere safe** — it won't be shown again.
+that password somewhere safe**, it won't be shown again.
 
-## Step 4 — Confirm it worked
+## Step 4: Confirm it worked
 
 Look for this near the end of the output:
 
@@ -97,33 +120,33 @@ Look for this near the end of the output:
 Verification PASSED — OpenClaw is live and answering with your API key.
 ```
 
-That's it — your assistant is running. If you gave it a Telegram bot
-token, you'll also get a short "CONFIRMED" message on Telegram as a second
-confirmation.
+That's it, your assistant is running. If you gave it a Telegram bot
+token, you'll also get a short "CONFIRMED" message on Telegram as a
+second confirmation.
 
 ---
 
 ## Keeping it updated
 
 By default, your assistant restarts itself automatically if it ever
-crashes, but it does **not** auto-update to newer versions — that's a
-deliberate choice so a new release can't unexpectedly change how your
-assistant behaves without you knowing. If you want automatic updates
-turned on, edit `/opt/openclaw/watchdog.env` on your server and set
+crashes, but it does **not** auto-update to newer versions. That's on
+purpose, so a new release can't unexpectedly change how your assistant
+behaves without you knowing. If you'd like automatic updates turned on,
+edit `/opt/openclaw/watchdog.env` on your server and set
 `OPENCLAW_AUTO_UPDATE=true`.
 
 ---
 
-## Need help? Toggle us in — you're always in control
+## Need help? Invite us in, on your terms
 
 We never have standing access to your server. If something's broken and
-you want us to take a look, run this on your server:
+you'd like us to take a look, run this on your server:
 
 ```
 sudo ./support-access.sh on
 ```
 
-This grants us SSH access. It stays on for as long as you need — there's
+This grants us SSH access. It stays on for as long as you need. There's
 no clock that cuts us off mid-fix, since real troubleshooting sometimes
 takes longer than expected. You'll see a confirmation like this:
 
@@ -132,7 +155,8 @@ Support access is now ON.
 Turns off: when YOU run: sudo ./support-access.sh off
 ```
 
-When we tell you we're done and everything checks out, turn it back off:
+Once we let you know we're done and everything checks out, turn it back
+off:
 
 ```
 sudo ./support-access.sh off
@@ -145,19 +169,18 @@ sudo ./support-access.sh status
 ```
 
 If you'd rather have a safety net that turns access off automatically in
-case you forget, you can opt into one at grant time — e.g.
-`sudo ./support-access.sh on --hours 24` still turns off on its own after
-24 hours, but only if you explicitly ask for that; the default is no
-timer at all.
+case you forget, you can opt into one when you grant it. For example,
+`sudo ./support-access.sh on --hours 24` turns itself off after 24 hours
+on its own, but only if you ask for that. The default is no timer at all.
 
-That's the entire support model: you decide when we can get in, and for
-how long — no standing keys, no passwords we hold, nothing that expires
-out from under an in-progress fix.
+That's the whole support model in a sentence: you decide when we can get
+in, and for how long. No standing keys, no passwords we hold, and nothing
+that expires out from under you mid-fix.
 
 ---
 
 ## Questions
 
-If anything in this guide doesn't work as described, reach out and we'll
-help you through it directly — no need to have your server accessible to
-us for that first conversation.
+If anything in this guide doesn't work the way it's described, reach out
+and we'll help you through it directly. No need to give us access to your
+server just to have that first conversation.
