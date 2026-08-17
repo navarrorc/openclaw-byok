@@ -326,7 +326,7 @@ fi
 #     missing: don't ask for info a channel already handed you (e.g.
 #     Telegram messages arrive pre-tagged with the sender's name).
 # ---------------------------------------------------------------------------
-log "Adding one instruction to the assistant's default AGENTS.md"
+log "Adding a few instructions to the assistant's default AGENTS.md"
 cat > /tmp/openclaw-AGENTS-addendum.md <<'AGENTSMD'
 
 ## Use the name you're already given
@@ -337,11 +337,49 @@ That name is already known, don't ask for it. Greet the person by that name
 and save it to USER.md right away. Only ask what to call them if a channel
 genuinely gives you no name to go on, or if they tell you they'd prefer
 something else.
+
+## Offer buttons, not open text, for multiple-choice questions
+
+Whenever you're offering the person a small set of discrete choices (yes/no,
+pick-one-of-a-few), use Telegram's inline buttons via the message tool's
+`buttons` parameter instead of asking them to type a word back:
+
+```json5
+{
+  action: "send",
+  channel: "telegram",
+  to: "<chat id>",
+  message: "Want auto-updates turned on?",
+  buttons: [[{ text: "Yes", callback_data: "yes" }, { text: "No", callback_data: "no" }]]
+}
+```
+
+Tapping a button sends the callback text back to you as a normal message.
+Reserve free-text questions for things that genuinely need a written answer.
 AGENTSMD
 docker cp /tmp/openclaw-AGENTS-addendum.md openclaw:/tmp/agents-addendum.md
 docker exec openclaw sh -c "grep -qF 'Use the name you'\''re already given' /data/workspace/AGENTS.md 2>/dev/null || cat /tmp/agents-addendum.md >> /data/workspace/AGENTS.md"
 docker exec openclaw rm -f /tmp/agents-addendum.md
 rm -f /tmp/openclaw-AGENTS-addendum.md
+
+# Skip the cutesy self-naming ritual (BOOTSTRAP.md's "figure out who you
+# are" first-run conversation) — for this product the assistant is just
+# "AI Assistant" by default. Pre-filling IDENTITY.md and removing
+# BOOTSTRAP.md (AGENTS.md's own "First Run" section only triggers it "if
+# BOOTSTRAP.md exists") skips the ritual entirely instead of asking the
+# user three unnecessary questions before it will do anything useful.
+docker exec openclaw sh -c 'rm -f /data/workspace/BOOTSTRAP.md'
+cat > /tmp/openclaw-IDENTITY.md <<'IDENTITYMD'
+# IDENTITY.md - Who Am I?
+
+- **Name:** AI Assistant
+- **Creature:** AI assistant
+- **Vibe:** Direct, friendly, and helpful. No persona beyond this.
+- **Emoji:** 🤖
+- **Avatar:** _(none set)_
+IDENTITYMD
+docker cp /tmp/openclaw-IDENTITY.md openclaw:/data/workspace/IDENTITY.md
+rm -f /tmp/openclaw-IDENTITY.md
 
 # ---------------------------------------------------------------------------
 # 7b. Wire Telegram in as a real, live channel (not just a one-off notify).
@@ -373,6 +411,13 @@ cfg.bindings.push({ agentId: 'main', match: { channel: 'telegram', accountId: 'm
 cfg.plugins = cfg.plugins || {};
 cfg.plugins.entries = cfg.plugins.entries || {};
 cfg.plugins.entries.telegram = { enabled: true };
+// Default ackReactionScope ('group-mentions') never fires in a plain DM, so
+// there's zero visible feedback between sending a message and the reply
+// landing. 'all' + removeAckAfterReply gives a real 👀 reaction the instant
+// the message arrives, gone again once the reply is sent.
+cfg.messages = cfg.messages || {};
+cfg.messages.ackReactionScope = 'all';
+cfg.messages.removeAckAfterReply = true;
 fs.writeFileSync(path, JSON.stringify(cfg, null, 2));
 " || warn "Could not write Telegram config automatically. See CUSTOMER_SETUP_GUIDE.md's troubleshooting section."
 
