@@ -51,6 +51,15 @@ else
     echo "User '$OPENCLAW_USER' already exists, skipping creation."
 fi
 
+# The account has no password (adduser --disabled-password) and SSH is
+# key-only, so plain `sudo` group membership can never authenticate — it
+# always demands a password that doesn't exist. Grant real passwordless
+# sudo via a dedicated sudoers drop-in so the summary's claim is true.
+SUDOERS_DROPIN="/etc/sudoers.d/90-$OPENCLAW_USER-nopasswd"
+echo "$OPENCLAW_USER ALL=(ALL) NOPASSWD:ALL" > "$SUDOERS_DROPIN"
+chmod 440 "$SUDOERS_DROPIN"
+visudo -cf "$SUDOERS_DROPIN" || die "Generated sudoers drop-in failed validation: $SUDOERS_DROPIN"
+
 install -d -m 700 -o "$OPENCLAW_USER" -g "$OPENCLAW_USER" "/home/$OPENCLAW_USER/.ssh"
 if [ ! -s "/home/$OPENCLAW_USER/.ssh/authorized_keys" ]; then
     if [ -s /root/.ssh/authorized_keys ]; then
