@@ -202,14 +202,28 @@ if [ -z "${GEMINI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${ANTHR
         openai)
             read -r -p "Paste your OpenAI API key: " OPENAI_API_KEY
             OPENCLAW_PRIMARY_MODEL="${OPENCLAW_PRIMARY_MODEL_OVERRIDE:-openai/gpt-5.1}"
+            MODEL_DISPLAY_NAME="GPT-5.1"
             ;;
         anthropic)
             read -r -p "Paste your Anthropic API key: " ANTHROPIC_API_KEY
             OPENCLAW_PRIMARY_MODEL="${OPENCLAW_PRIMARY_MODEL_OVERRIDE:-anthropic/claude-sonnet-5}"
+            MODEL_DISPLAY_NAME="Claude Sonnet 5"
             ;;
         *)
             read -r -p "Paste your Gemini API key: " GEMINI_API_KEY
+            MODEL_DISPLAY_NAME="Gemini 2.5 Flash"
             ;;
+    esac
+fi
+# The block above is skipped entirely when a key is pre-set via env var
+# (the documented non-interactive path: GEMINI_API_KEY=xxx ./setup.sh), so
+# MODEL_DISPLAY_NAME needs its own fallback here, derived from whichever
+# model actually ended up configured.
+if [ -z "${MODEL_DISPLAY_NAME:-}" ]; then
+    case "$OPENCLAW_PRIMARY_MODEL" in
+        openai/*) MODEL_DISPLAY_NAME="GPT-5.1" ;;
+        anthropic/*) MODEL_DISPLAY_NAME="Claude Sonnet 5" ;;
+        *) MODEL_DISPLAY_NAME="Gemini 2.5 Flash" ;;
     esac
 fi
 
@@ -338,16 +352,6 @@ That name is already known, don't ask for it. Greet the person by that name
 and save it to USER.md right away. Only ask what to call them if a channel
 genuinely gives you no name to go on, or if they tell you they'd prefer
 something else.
-
-## Show a "thinking" placeholder on Telegram
-
-Telegram's native typing indicator is easy to miss, and OpenClaw can't edit
-Telegram messages in place (that only works on Discord/Slack). Fake the same
-effect with send-then-delete: at the very start of handling a Telegram
-message, use the `telegram` tool's `sendMessage` action to send `…` to the
-sender, and remember the message id it returns. Right before your real reply
-goes out, use the `telegram` tool's `deleteMessage` action to remove that
-placeholder. Do this every turn, not just sometimes.
 <!-- openclaw-byok-addendum:end -->
 AGENTSMD
 docker cp /tmp/openclaw-AGENTS-addendum.md openclaw:/tmp/agents-addendum.md
@@ -416,17 +420,24 @@ cfg.bindings.push({ agentId: 'main', match: { channel: 'telegram', accountId: 'm
 cfg.plugins = cfg.plugins || {};
 cfg.plugins.entries = cfg.plugins.entries || {};
 cfg.plugins.entries.telegram = { enabled: true };
-// A prompt-driven send-then-delete 'thinking' placeholder was tried and
-// reverted (08-17): under rapid repeated messages it made the agent
-// unreliable -- several turns came back with no reply at all, or garbage
-// like a bare 'NO'. A reaction is a GATEWAY-level feature, not something
-// the model has to remember to do right, so it's the safe default. Default
-// emoji (👀) read as 'freaky' to Rob — swapped for something calmer, scope
-// still 'all' since the default ('group-mentions') never fires in a DM.
+// A prompt-driven send-then-delete 'thinking' placeholder was tried twice
+// (08-17) and dropped for real this time: on a genuinely clean session
+// (confirmed the earlier failures were session pollution from unrelated
+// testing, not this instruction) the model just never attempted the tool
+// calls -- 0 real tries across several messages. Not reliable enough to
+// ship. A reaction is a GATEWAY-level feature, not something the model has
+// to remember to do right, so it's the safe default. Default emoji (👀)
+// read as 'freaky' to Rob -- swapped for something calmer. Scope 'all'
+// since the default ('group-mentions') never fires in a DM.
 cfg.messages = cfg.messages || {};
 cfg.messages.ackReaction = '⏳';
 cfg.messages.ackReactionScope = 'all';
 cfg.messages.removeAckAfterReply = true;
+// Shows which model is actually answering (Rob: FarmOps shows this and
+// 'it's a dead give away' when it's missing). Fully deterministic -- we
+// already know the model from the provider the customer picked, no need
+// to rely on the LLM reporting on itself.
+cfg.messages.responsePrefix = '🧠 ${MODEL_DISPLAY_NAME}';
 fs.writeFileSync(path, JSON.stringify(cfg, null, 2));
 " || warn "Could not write Telegram config automatically. See CUSTOMER_SETUP_GUIDE.md's troubleshooting section."
 
