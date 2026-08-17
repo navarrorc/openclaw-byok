@@ -328,6 +328,7 @@ fi
 # ---------------------------------------------------------------------------
 log "Adding a few instructions to the assistant's default AGENTS.md"
 cat > /tmp/openclaw-AGENTS-addendum.md <<'AGENTSMD'
+<!-- openclaw-byok-addendum:start -->
 
 ## Use the name you're already given
 
@@ -337,39 +338,22 @@ That name is already known, don't ask for it. Greet the person by that name
 and save it to USER.md right away. Only ask what to call them if a channel
 genuinely gives you no name to go on, or if they tell you they'd prefer
 something else.
-
-## Offer buttons, not open text, for multiple-choice questions
-
-Whenever you're offering the person a small set of discrete choices (yes/no,
-pick-one-of-a-few), use Telegram's inline buttons via the message tool's
-`buttons` parameter instead of asking them to type a word back:
-
-```json5
-{
-  action: "send",
-  channel: "telegram",
-  to: "<chat id>",
-  message: "Want auto-updates turned on?",
-  buttons: [[{ text: "Yes", callback_data: "yes" }, { text: "No", callback_data: "no" }]]
-}
-```
-
-Tapping a button sends the callback text back to you as a normal message.
-Reserve free-text questions for things that genuinely need a written answer.
-
-## Show a "thinking" placeholder on Telegram
-
-Telegram doesn't reliably surface its native typing indicator (easy to
-miss), and OpenClaw can't edit Telegram messages in place (that only works
-on Discord/Slack). So fake the same effect with send-then-delete: at the
-very start of handling a Telegram message, use the `telegram` tool's
-`sendMessage` action to send `…` to the sender, and remember the message id
-it returns. Right before your real reply goes out, use the `telegram` tool's
-`deleteMessage` action to remove that placeholder. Do this every turn, not
-just sometimes — a placeholder that never gets cleaned up is worse than none.
+<!-- openclaw-byok-addendum:end -->
 AGENTSMD
 docker cp /tmp/openclaw-AGENTS-addendum.md openclaw:/tmp/agents-addendum.md
-docker exec openclaw sh -c "grep -qF 'Use the name you'\''re already given' /data/workspace/AGENTS.md 2>/dev/null || cat /tmp/agents-addendum.md >> /data/workspace/AGENTS.md"
+# Strip any PRIOR copy of our marked block before appending the current one,
+# so re-running setup.sh after we've changed the addendum's content actually
+# updates it instead of silently no-op'ing forever (real bug, found 08-17: an
+# earlier grep-for-one-phrase check meant a later content change never
+# actually got deployed to an already-set-up box).
+docker exec openclaw node -e "
+const fs = require('fs');
+const path = '/data/workspace/AGENTS.md';
+let body = fs.readFileSync(path, 'utf8');
+body = body.replace(/\n?<!-- openclaw-byok-addendum:start -->[\s\S]*?<!-- openclaw-byok-addendum:end -->\n?/, '');
+const addendum = fs.readFileSync('/tmp/agents-addendum.md', 'utf8');
+fs.writeFileSync(path, body.replace(/\s+$/, '') + '\n' + addendum);
+"
 docker exec openclaw rm -f /tmp/agents-addendum.md
 rm -f /tmp/openclaw-AGENTS-addendum.md
 
@@ -422,12 +406,17 @@ cfg.bindings.push({ agentId: 'main', match: { channel: 'telegram', accountId: 'm
 cfg.plugins = cfg.plugins || {};
 cfg.plugins.entries = cfg.plugins.entries || {};
 cfg.plugins.entries.telegram = { enabled: true };
-// Tried the native 👀 ack-reaction here first; Rob found it 'freaky' and
-// asked for a FarmOps/Nelita-style placeholder message instead (see the
-// AGENTS.md addendum below), so the reaction is explicitly OFF, not just
-// left at its useless-for-DMs default.
+// A prompt-driven send-then-delete 'thinking' placeholder was tried and
+// reverted (08-17): under rapid repeated messages it made the agent
+// unreliable -- several turns came back with no reply at all, or garbage
+// like a bare 'NO'. A reaction is a GATEWAY-level feature, not something
+// the model has to remember to do right, so it's the safe default. Default
+// emoji (👀) read as 'freaky' to Rob — swapped for something calmer, scope
+// still 'all' since the default ('group-mentions') never fires in a DM.
 cfg.messages = cfg.messages || {};
-cfg.messages.ackReaction = '';
+cfg.messages.ackReaction = '⏳';
+cfg.messages.ackReactionScope = 'all';
+cfg.messages.removeAckAfterReply = true;
 fs.writeFileSync(path, JSON.stringify(cfg, null, 2));
 " || warn "Could not write Telegram config automatically. See CUSTOMER_SETUP_GUIDE.md's troubleshooting section."
 
