@@ -356,6 +356,17 @@ pick-one-of-a-few), use Telegram's inline buttons via the message tool's
 
 Tapping a button sends the callback text back to you as a normal message.
 Reserve free-text questions for things that genuinely need a written answer.
+
+## Show a "thinking" placeholder on Telegram
+
+Telegram doesn't reliably surface its native typing indicator (easy to
+miss), and OpenClaw can't edit Telegram messages in place (that only works
+on Discord/Slack). So fake the same effect with send-then-delete: at the
+very start of handling a Telegram message, use the `telegram` tool's
+`sendMessage` action to send `…` to the sender, and remember the message id
+it returns. Right before your real reply goes out, use the `telegram` tool's
+`deleteMessage` action to remove that placeholder. Do this every turn, not
+just sometimes — a placeholder that never gets cleaned up is worse than none.
 AGENTSMD
 docker cp /tmp/openclaw-AGENTS-addendum.md openclaw:/tmp/agents-addendum.md
 docker exec openclaw sh -c "grep -qF 'Use the name you'\''re already given' /data/workspace/AGENTS.md 2>/dev/null || cat /tmp/agents-addendum.md >> /data/workspace/AGENTS.md"
@@ -411,13 +422,12 @@ cfg.bindings.push({ agentId: 'main', match: { channel: 'telegram', accountId: 'm
 cfg.plugins = cfg.plugins || {};
 cfg.plugins.entries = cfg.plugins.entries || {};
 cfg.plugins.entries.telegram = { enabled: true };
-// Default ackReactionScope ('group-mentions') never fires in a plain DM, so
-// there's zero visible feedback between sending a message and the reply
-// landing. 'all' + removeAckAfterReply gives a real 👀 reaction the instant
-// the message arrives, gone again once the reply is sent.
+// Tried the native 👀 ack-reaction here first; Rob found it 'freaky' and
+// asked for a FarmOps/Nelita-style placeholder message instead (see the
+// AGENTS.md addendum below), so the reaction is explicitly OFF, not just
+// left at its useless-for-DMs default.
 cfg.messages = cfg.messages || {};
-cfg.messages.ackReactionScope = 'all';
-cfg.messages.removeAckAfterReply = true;
+cfg.messages.ackReaction = '';
 fs.writeFileSync(path, JSON.stringify(cfg, null, 2));
 " || warn "Could not write Telegram config automatically. See CUSTOMER_SETUP_GUIDE.md's troubleshooting section."
 
