@@ -2,7 +2,7 @@
 #
 # OpenClaw BYOK sandbox — one-shot customer setup script.
 #
-# Run this as root on a FRESH Ubuntu 22.04/24.04 droplet (DigitalOcean,
+# Run this as root on a FRESH Ubuntu 22.04/24.04/26.04 droplet (DigitalOcean,
 # Hetzner, Linode, or any equivalent VPS). It provisions a hardened,
 # minimal Docker host running a single vanilla OpenClaw instance using
 # YOUR OWN LLM API key. Nobody but you holds SSH access to this box
@@ -102,7 +102,7 @@ fi
 log "Installing UFW + fail2ban"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq ufw fail2ban curl ca-certificates gnupg >/dev/null
+apt-get install -y -qq ufw fail2ban curl ca-certificates gnupg whiptail >/dev/null
 
 ufw --force reset >/dev/null
 ufw default deny incoming >/dev/null
@@ -171,19 +171,44 @@ systemctl enable --now docker >/dev/null
 # ---------------------------------------------------------------------------
 log "LLM provider key"
 if [ -z "${GEMINI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    echo "Which LLM provider are you using? (gemini/openai/anthropic)"
-    read -r -p "> " PROVIDER
+    # Arrow-key selectable menu (whiptail) instead of typing the provider
+    # name — a typo here used to silently fall through to Gemini with no
+    # warning. If whiptail can't run for some reason (no real TTY), fall
+    # back to a plain numbered menu instead of guessing.
+    PROVIDER=""
+    if [ -t 0 ] && command -v whiptail >/dev/null 2>&1; then
+        PROVIDER=$(whiptail --title "Choose your AI provider" \
+            --menu "Use arrow keys to pick one, then press Enter:" 15 60 3 \
+            "gemini"    "Google Gemini" \
+            "openai"    "OpenAI (ChatGPT models)" \
+            "anthropic" "Anthropic (Claude models)" \
+            3>&1 1>&2 2>&3) || PROVIDER=""
+    fi
+    # Belt and suspenders: only trust $PROVIDER if it's actually one of our
+    # three known values. If whiptail errored (e.g. "TERM not set") its
+    # error text can end up here instead of an empty string.
+    case "$PROVIDER" in
+        gemini | openai | anthropic) ;;
+        *) PROVIDER="" ;;
+    esac
+    if [ -z "$PROVIDER" ]; then
+        echo "Which LLM provider are you using?"
+        select choice in "gemini" "openai" "anthropic"; do
+            [ -n "$choice" ] && PROVIDER="$choice" && break
+            echo "Please enter 1, 2, or 3."
+        done
+    fi
     case "$PROVIDER" in
         openai)
-            read -r -s -p "Paste your OpenAI API key: " OPENAI_API_KEY; echo
+            read -r -p "Paste your OpenAI API key: " OPENAI_API_KEY
             OPENCLAW_PRIMARY_MODEL="${OPENCLAW_PRIMARY_MODEL_OVERRIDE:-openai/gpt-5.1}"
             ;;
         anthropic)
-            read -r -s -p "Paste your Anthropic API key: " ANTHROPIC_API_KEY; echo
+            read -r -p "Paste your Anthropic API key: " ANTHROPIC_API_KEY
             OPENCLAW_PRIMARY_MODEL="${OPENCLAW_PRIMARY_MODEL_OVERRIDE:-anthropic/claude-sonnet-5}"
             ;;
         *)
-            read -r -s -p "Paste your Gemini API key: " GEMINI_API_KEY; echo
+            read -r -p "Paste your Gemini API key: " GEMINI_API_KEY
             ;;
     esac
 fi
