@@ -1,0 +1,76 @@
+# Reference compose file for the OpenClaw BYOK sandbox deployment.
+#
+# This is NOT what actually drives the running instance — the live deployment
+# is managed entirely by Coolify (project "OpenClaw-Product-POC" on the
+# sandbox VPS), which owns its own generated copy of this file plus a
+# .env under /data/coolify/services/<uuid>/ on the host. This copy exists so
+# the shape of the deployment is reviewable and versioned in this repo.
+#
+# It mirrors Coolify's built-in "openclaw" one-click service template
+# (coollabsio/openclaw + coollabsio/openclaw-browser), stripped to the
+# variables that matter for a vanilla, BYOK-only setup. Everything else in
+# this repo (AGENTS.md, SOUL.md) gets baked into the workspace volume, not
+# mounted from here.
+#
+# BYOK: the ONLY credential that matters for this product is LLM_API_KEY
+# (mapped below to GEMINI_API_KEY for this smoke test). In the real product
+# this env var is entered directly by the customer into their own Coolify
+# environment variable field — it is never typed, stored, or logged by us.
+
+services:
+  openclaw:
+    image: coollabsio/openclaw:2026.2.6
+    container_name: openclaw-sandbox
+    restart: unless-stopped
+    environment:
+      # --- BYOK credential: customer supplies this, we never see it ---
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENCLAW_PRIMARY_MODEL=${OPENCLAW_PRIMARY_MODEL:-google/gemini-2.5-flash}
+
+      # --- gateway / auth (auto-generated per-deployment by Coolify) ---
+      - AUTH_USERNAME=${AUTH_USERNAME}
+      - AUTH_PASSWORD=${AUTH_PASSWORD}
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
+      - OPENCLAW_GATEWAY_PORT=18789
+      - OPENCLAW_GATEWAY_BIND=loopback
+      - PORT=8080
+
+      # --- vanilla workspace layout, no Dataverse / bridges / shared memory ---
+      - OPENCLAW_STATE_DIR=/data/.openclaw
+      - OPENCLAW_WORKSPACE_DIR=/data/workspace
+
+      # --- headless browser tool sidecar (ships with the template) ---
+      - BROWSER_CDP_URL=http://browser:9223
+      - BROWSER_DEFAULT_PROFILE=openclaw
+    volumes:
+      - openclaw-data:/data
+    depends_on:
+      browser:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  browser:
+    image: coollabsio/openclaw-browser:latest
+    container_name: browser-sandbox
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - CHROME_CLI=--remote-debugging-port=9222
+    volumes:
+      - browser-data:/config
+    shm_size: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/9222' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  openclaw-data:
+  browser-data:
