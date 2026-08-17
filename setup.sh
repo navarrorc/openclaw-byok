@@ -338,6 +338,16 @@ That name is already known, don't ask for it. Greet the person by that name
 and save it to USER.md right away. Only ask what to call them if a channel
 genuinely gives you no name to go on, or if they tell you they'd prefer
 something else.
+
+## Show a "thinking" placeholder on Telegram
+
+Telegram's native typing indicator is easy to miss, and OpenClaw can't edit
+Telegram messages in place (that only works on Discord/Slack). Fake the same
+effect with send-then-delete: at the very start of handling a Telegram
+message, use the `telegram` tool's `sendMessage` action to send `…` to the
+sender, and remember the message id it returns. Right before your real reply
+goes out, use the `telegram` tool's `deleteMessage` action to remove that
+placeholder. Do this every turn, not just sometimes.
 <!-- openclaw-byok-addendum:end -->
 AGENTSMD
 docker cp /tmp/openclaw-AGENTS-addendum.md openclaw:/tmp/agents-addendum.md
