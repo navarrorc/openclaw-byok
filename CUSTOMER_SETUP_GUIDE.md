@@ -133,8 +133,10 @@ The script will ask you a few questions:
    the script and left this blank, it's still fine, just reach out and
    we'll walk you through adding a key afterward before anything else
    changes on the box.
-2. **Which AI provider you're using** (Gemini, OpenAI, or Anthropic) and
-   **your API key** for it. You can get a key from:
+2. **Which AI provider you're using.** A menu pops up, use the arrow keys
+   to pick Gemini, OpenAI, or Anthropic, then press Enter. Next it'll ask
+   for **your API key** for that provider (it'll show on screen as you
+   paste it, so you can tell it went through). You can get a key from:
    - Gemini: [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
    - OpenAI: [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
    - Anthropic: [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)
