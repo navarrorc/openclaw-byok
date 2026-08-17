@@ -77,9 +77,10 @@ anyone logs in:
 Once connected, paste this:
 
 ```
-curl -fsSL <URL-WE-GIVE-YOU>/setup.sh -o setup.sh
-curl -fsSL <URL-WE-GIVE-YOU>/install-watchdog.sh -o install-watchdog.sh
-chmod +x setup.sh install-watchdog.sh
+curl -fsSL https://raw.githubusercontent.com/navarrorc/openclaw-byok/v1.0.0/setup.sh -o setup.sh
+curl -fsSL https://raw.githubusercontent.com/navarrorc/openclaw-byok/v1.0.0/install-watchdog.sh -o install-watchdog.sh
+curl -fsSL https://raw.githubusercontent.com/navarrorc/openclaw-byok/v1.0.0/support-access.sh -o support-access.sh
+chmod +x setup.sh install-watchdog.sh support-access.sh
 ./setup.sh
 ```
 
