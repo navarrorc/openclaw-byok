@@ -88,7 +88,51 @@ The script will ask you a few questions:
 
 1. **Your SSH public key** (only if one wasn't already set up when you
    created the droplet). This makes sure you can still log back in after
-   the script locks down password logins for security.
+   the script locks down password logins for security. If you don't know
+   what that is or don't have one yet, here's how to get one:
+
+   **What it is, in plain terms:** an SSH key is a pair of files that let
+   you log in without typing a password. One half stays secret on your
+   own computer (never share this one). The other half, the "public" one,
+   is safe to hand out. Pasting your public key here lets your assistant
+   recognize your computer from now on.
+
+   **If you already have one:** you'll usually find it at
+   `~/.ssh/id_ed25519.pub` (Mac/Linux) or `C:\Users\<you>\.ssh\id_ed25519.pub`
+   (Windows). Open that file, copy everything inside (it's one long line
+   starting with `ssh-ed25519`), and paste it when the script asks.
+
+   **If you don't have one, create one first:**
+
+   - **Mac/Linux:** in a Terminal window, run:
+     ```
+     ssh-keygen -t ed25519
+     ```
+     Press Enter at every question to accept the defaults (a passphrase
+     is optional, you can leave it blank). Then show your public key with:
+     ```
+     cat ~/.ssh/id_ed25519.pub
+     ```
+   - **Windows:** in PowerShell, run:
+     ```
+     ssh-keygen -t ed25519
+     ```
+     (PowerShell already has this built in, no download needed.) Press
+     Enter at every question. Then show your public key with:
+     ```
+     type $env:USERPROFILE\.ssh\id_ed25519.pub
+     ```
+
+   Either way, you'll get back one line of text starting with
+   `ssh-ed25519 AAAA...`. Select that whole line, copy it, and paste it
+   in when `./setup.sh` asks for your SSH public key.
+
+   **What if you skip this?** The script will still finish, but it won't
+   be able to fully lock down password logins until a key is in place, so
+   don't restart your server until you've added one. If you already ran
+   the script and left this blank, it's still fine, just reach out and
+   we'll walk you through adding a key afterward before anything else
+   changes on the box.
 2. **Which AI provider you're using** (Gemini, OpenAI, or Anthropic) and
    **your API key** for it. You can get a key from:
    - Gemini: [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
