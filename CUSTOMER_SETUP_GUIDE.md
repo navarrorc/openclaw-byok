@@ -140,9 +140,14 @@ The script will ask you a few questions:
    - Gemini: [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
    - OpenAI: [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
    - Anthropic: [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)
-3. **A Telegram bot token** (optional). If you want a message confirming
-   setup succeeded sent straight to you, add one here. Totally fine to
-   skip this.
+3. **A Telegram bot and your Telegram ID.** This is how you'll actually
+   talk to your assistant day to day, so it's required, not optional:
+   - Open Telegram, message **@BotFather**, send `/newbot`, and follow the
+     prompts. Paste the token it gives you when asked.
+   - Then message **@userinfobot**, it replies with your numeric Telegram
+     ID. Paste that in when asked too.
+   - The script wires this in as a live, working chat: after setup
+     finishes, message your bot and it replies for real.
 
 It takes 3 to 5 minutes to finish. Along the way it will:
 
@@ -152,9 +157,11 @@ It takes 3 to 5 minutes to finish. Along the way it will:
 - Install a small watchdog that restarts your assistant automatically if
   it ever crashes (it can also auto-update itself, though that's off by
   default, see below)
+- Connect your Telegram bot to your assistant, so it's ready to chat the
+  moment setup finishes
 - Send a real test message through your assistant to confirm everything
-  is wired up correctly, and show you the result (and Telegram it to you
-  too, if you added a bot token)
+  is wired up correctly, show you the result, and send you a confirmation
+  on Telegram
 
 When it finishes, you'll see a summary with your dashboard login. **Save
 that password somewhere safe**, it won't be shown again.
@@ -167,9 +174,12 @@ Look for this near the end of the output:
 Verification PASSED — OpenClaw is live and answering with your API key.
 ```
 
-That's it, your assistant is running. If you gave it a Telegram bot
-token, you'll also get a short "CONFIRMED" message on Telegram as a
-second confirmation.
+That's it, your assistant is running. You'll also get a short "CONFIRMED"
+message on Telegram as a second confirmation.
+
+Now try the real thing: open Telegram, find the bot you created, and send
+it "Hey". It should reply within a few seconds. That's your assistant,
+actually working.
 
 ---
 
