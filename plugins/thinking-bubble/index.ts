@@ -73,6 +73,26 @@ const pendingBySession = new Map<string, Placeholder>();
  * WEBSITE_AWAIT_TIMEOUT_MS in plugins/website/index.ts. */
 const PLACEHOLDER_TIMEOUT_MS = 3 * 60 * 1000;
 
+const STUCK_PLACEHOLDER_TEXT = "That one didn't come through -- try sending it again.";
+
+/** Edits a placeholder that's being abandoned (past its timeout, or
+ * superseded by a new message on the same session) into a plain retry
+ * notice, and swallows/logs failure the same way every other Telegram call
+ * in this plugin does -- there's no further recovery action to take if this
+ * one fails too. */
+function settleStuckPlaceholder(botToken: string, placeholder: Placeholder) {
+  tg(botToken, "editMessageText", {
+    chat_id: placeholder.chatId,
+    message_id: placeholder.messageId,
+    text: STUCK_PLACEHOLDER_TEXT,
+  }).catch((err) => {
+    console.error(
+      "[thinking-bubble] failed to edit stuck placeholder:",
+      err instanceof Error ? err.message : String(err),
+    );
+  });
+}
+
 function placeholderText(): string {
   const label = process.env.THINKING_BUBBLE_MODEL_LABEL;
   return label ? `🧠 ${label} …` : "…";
@@ -148,17 +168,7 @@ export default definePluginEntry({
         if (now - placeholder.since <= PLACEHOLDER_TIMEOUT_MS) continue;
 
         pendingBySession.delete(sessionKey); // evict first: don't act twice on the same placeholder
-
-        tg(botToken, "editMessageText", {
-          chat_id: placeholder.chatId,
-          message_id: placeholder.messageId,
-          text: "That one didn't come through -- try sending it again.",
-        }).catch((err) => {
-          console.error(
-            "[thinking-bubble] failed to edit stuck placeholder:",
-            err instanceof Error ? err.message : String(err),
-          );
-        });
+        settleStuckPlaceholder(botToken, placeholder);
       }
     }, 30_000).unref();
 
@@ -183,6 +193,15 @@ export default definePluginEntry({
           });
           const messageId = sent.result?.message_id;
           if (typeof messageId === "number") {
+            // A prior placeholder still tracked for this session was never
+            // claimed by reply_payload_sending -- the user sending another
+            // message means it's abandoned, not just slow. Settle it now
+            // rather than silently clobbering the tracking entry below and
+            // leaving it orphaned (untracked, unedited) until whenever the
+            // next sweep pass would otherwise have caught it.
+            const orphaned = pendingBySession.get(sessionKey);
+            if (orphaned) settleStuckPlaceholder(botToken, orphaned);
+
             pendingBySession.set(sessionKey, { chatId, messageId, since: Date.now() });
           }
         } catch (err) {
