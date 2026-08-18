@@ -6,7 +6,7 @@
 // `setMyCommands` already populates) of this product's most useful
 // commands.
 //
-// --- No standalone announcement message ---
+// --- No standalone announcement message (but see the correction below) ---
 //
 // This plugin used to send a dedicated "Quick menu ready" message on the
 // first message_received of a session to attach the keyboard, tracked
@@ -19,21 +19,20 @@
 // "remove it entirely, permanently": after a couple of uses the button
 // grid is self-explanatory, and repeating the explanation is just noise.
 //
-// Telegram's Bot API has no message-free way to register a persistent
-// custom keyboard -- `reply_markup` can only be attached to an actual
-// outbound message. But a `ReplyKeyboardMarkup` is chat-level client
-// state, not tied to the lifetime of the message that carried it: it
-// persists after that message is deleted (confirmed against Telegram
-// bot-developer references -- "the original message and the reply
-// keyboard are two different unrelated entities"; deleting one does not
-// affect the other). So instead of a dedicated send,
-// `thinking-bubble/index.ts` attaches QUICK_MENU_KEYBOARD (duplicated
-// there, see its header) to its own placeholder message -- which already
-// goes out via a raw Telegram `sendMessage` call on essentially every
-// non-command first message and gets deleted moments later anyway. Zero
-// new visible chat content, no per-session/per-chat state to track or
-// persist across restarts, and no repeat-firing bug is possible because
-// there's no separate trigger left to misfire.
+// A follow-up version of this plugin then attached QUICK_MENU_KEYBOARD to
+// thinking-bubble's placeholder message on the theory that a
+// `ReplyKeyboardMarkup` is chat-level client state that survives deletion
+// of the message that carried it -- so it was safe to attach to a
+// send-then-delete placeholder. That theory came from an unverified
+// WebSearch, was never checked against a real device, and Rob's own real
+// device testing (08-18) directly contradicted it: the keyboard vanished
+// after the placeholder was deleted. Telegram's own docs don't confirm
+// the "survives deletion" claim either way, and no real developer report
+// of this specific interaction (attach, then delete that exact message)
+// turned up anywhere searched -- see thinking-bubble/index.ts's header for
+// the full writeup and the actual fix (a never-deleted "permanent
+// carrier" message, tracked durably per chat, sent once ever). Do not
+// resurrect the "any deleted message is a safe carrier" assumption here.
 //
 // This plugin still ships and loads (openclaw.plugin.json, setup.sh) as
 // the canonical, curated definition of the button grid below --

@@ -115,17 +115,21 @@
 // The FIRST placeholder ever sent to a given chat (tracked durably in
 // registeredKeyboardChats.json under /data, so it survives container
 // restarts/redeploys, not the old in-memory-Set approach that reset on
-// every deploy) is never deleted. Instead of deleteMessage in
-// reply_payload_sending, it gets editMessageText'd into a short, one-line,
-// permanent notice and left in the chat forever -- the real answer still
-// arrives as a normal fresh message right after, same as always. Every
-// later placeholder in that chat (and every placeholder in every other
-// chat once it's had its own first one) behaves exactly as before:
-// send-then-delete, keyboard already registered from the surviving first
-// message. This satisfies all of: fires on /start (bug 1 fix makes /start
-// eligible for a placeholder at all), the carrier is never removed
-// afterward (bug 2 fix), and there is exactly one short notice ever per
-// chat -- not a repeat on every message.
+// every deploy) is the only one that ever gets QUICK_MENU_KEYBOARD attached,
+// and it is never deleted. Instead of deleteMessage in reply_payload_sending,
+// it gets editMessageText'd into a short, one-line, permanent notice and
+// left in the chat forever -- the real answer still arrives as a normal
+// fresh message right after, same as always. Every later placeholder in
+// that chat (and every placeholder in every other chat once it's had its
+// own first one) carries no reply_markup at all and behaves exactly as
+// before the whole keyboard feature existed: plain send-then-delete --
+// deliberately not re-sent on every turn, since that would put the exact
+// send-then-delete-a-keyboard-carrier pattern bug 2 distrusts right back on
+// every later message for zero benefit (the keyboard is already registered
+// from the one surviving carrier). This satisfies all of: fires on /start
+// (bug 1 fix makes /start eligible for a placeholder at all), the carrier
+// is never removed afterward (bug 2 fix), and there is exactly one short
+// notice ever per chat -- not a repeat on every message.
 //
 // QUICK_MENU_KEYBOARD is duplicated from quick-menu/index.ts (which still
 // owns the curated button content) rather than imported, matching every
@@ -395,11 +399,17 @@ export default definePluginEntry({
         try {
           const inboundTimestamp = extractTimestamp(event as Record<string, unknown>);
           const permanentCarrier = !registeredKeyboardChats.has(chatId);
+          // reply_markup only goes on the permanent carrier. Attaching it to
+          // every placeholder (as a prior version of this fix did) would put
+          // the exact same send-then-delete pattern back on every later
+          // message -- the thing bug 2 above says isn't safe to rely on --
+          // for zero benefit, since the keyboard is already registered by
+          // the chat's one surviving carrier.
           const sent = await tg(botToken, "sendMessage", {
             chat_id: chatId,
             text: placeholderText(),
             parse_mode: "HTML",
-            reply_markup: QUICK_MENU_KEYBOARD,
+            ...(permanentCarrier ? { reply_markup: QUICK_MENU_KEYBOARD } : {}),
           });
           if (typeof inboundTimestamp === "number") {
             console.log(`[thinking-bubble] placeholder sent ${Date.now() - inboundTimestamp}ms after inbound message`);

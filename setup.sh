@@ -605,17 +605,21 @@ cat > "$PLUGIN_DIR/index.ts" <<'PLUGINTS'
 // The FIRST placeholder ever sent to a given chat (tracked durably in
 // registeredKeyboardChats.json under /data, so it survives container
 // restarts/redeploys, not the old in-memory-Set approach that reset on
-// every deploy) is never deleted. Instead of deleteMessage in
-// reply_payload_sending, it gets editMessageText'd into a short, one-line,
-// permanent notice and left in the chat forever -- the real answer still
-// arrives as a normal fresh message right after, same as always. Every
-// later placeholder in that chat (and every placeholder in every other
-// chat once it's had its own first one) behaves exactly as before:
-// send-then-delete, keyboard already registered from the surviving first
-// message. This satisfies all of: fires on /start (bug 1 fix makes /start
-// eligible for a placeholder at all), the carrier is never removed
-// afterward (bug 2 fix), and there is exactly one short notice ever per
-// chat -- not a repeat on every message.
+// every deploy) is the only one that ever gets QUICK_MENU_KEYBOARD attached,
+// and it is never deleted. Instead of deleteMessage in reply_payload_sending,
+// it gets editMessageText'd into a short, one-line, permanent notice and
+// left in the chat forever -- the real answer still arrives as a normal
+// fresh message right after, same as always. Every later placeholder in
+// that chat (and every placeholder in every other chat once it's had its
+// own first one) carries no reply_markup at all and behaves exactly as
+// before the whole keyboard feature existed: plain send-then-delete --
+// deliberately not re-sent on every turn, since that would put the exact
+// send-then-delete-a-keyboard-carrier pattern bug 2 distrusts right back on
+// every later message for zero benefit (the keyboard is already registered
+// from the one surviving carrier). This satisfies all of: fires on /start
+// (bug 1 fix makes /start eligible for a placeholder at all), the carrier
+// is never removed afterward (bug 2 fix), and there is exactly one short
+// notice ever per chat -- not a repeat on every message.
 //
 // QUICK_MENU_KEYBOARD is duplicated from quick-menu/index.ts (which still
 // owns the curated button content) rather than imported, matching every
@@ -885,11 +889,17 @@ export default definePluginEntry({
         try {
           const inboundTimestamp = extractTimestamp(event as Record<string, unknown>);
           const permanentCarrier = !registeredKeyboardChats.has(chatId);
+          // reply_markup only goes on the permanent carrier. Attaching it to
+          // every placeholder (as a prior version of this fix did) would put
+          // the exact same send-then-delete pattern back on every later
+          // message -- the thing bug 2 above says isn't safe to rely on --
+          // for zero benefit, since the keyboard is already registered by
+          // the chat's one surviving carrier.
           const sent = await tg(botToken, "sendMessage", {
             chat_id: chatId,
             text: placeholderText(),
             parse_mode: "HTML",
-            reply_markup: QUICK_MENU_KEYBOARD,
+            ...(permanentCarrier ? { reply_markup: QUICK_MENU_KEYBOARD } : {}),
           });
           if (typeof inboundTimestamp === "number") {
             console.log(`[thinking-bubble] placeholder sent ${Date.now() - inboundTimestamp}ms after inbound message`);
@@ -1858,7 +1868,7 @@ cat > "$PLUGIN_DIR/index.ts" <<'QUICKMENUPLUGINTS'
 // `setMyCommands` already populates) of this product's most useful
 // commands.
 //
-// --- No standalone announcement message ---
+// --- No standalone announcement message (but see the correction below) ---
 //
 // This plugin used to send a dedicated "Quick menu ready" message on the
 // first message_received of a session to attach the keyboard, tracked
@@ -1871,21 +1881,20 @@ cat > "$PLUGIN_DIR/index.ts" <<'QUICKMENUPLUGINTS'
 // "remove it entirely, permanently": after a couple of uses the button
 // grid is self-explanatory, and repeating the explanation is just noise.
 //
-// Telegram's Bot API has no message-free way to register a persistent
-// custom keyboard -- `reply_markup` can only be attached to an actual
-// outbound message. But a `ReplyKeyboardMarkup` is chat-level client
-// state, not tied to the lifetime of the message that carried it: it
-// persists after that message is deleted (confirmed against Telegram
-// bot-developer references -- "the original message and the reply
-// keyboard are two different unrelated entities"; deleting one does not
-// affect the other). So instead of a dedicated send,
-// `thinking-bubble/index.ts` attaches QUICK_MENU_KEYBOARD (duplicated
-// there, see its header) to its own placeholder message -- which already
-// goes out via a raw Telegram `sendMessage` call on essentially every
-// non-command first message and gets deleted moments later anyway. Zero
-// new visible chat content, no per-session/per-chat state to track or
-// persist across restarts, and no repeat-firing bug is possible because
-// there's no separate trigger left to misfire.
+// A follow-up version of this plugin then attached QUICK_MENU_KEYBOARD to
+// thinking-bubble's placeholder message on the theory that a
+// `ReplyKeyboardMarkup` is chat-level client state that survives deletion
+// of the message that carried it -- so it was safe to attach to a
+// send-then-delete placeholder. That theory came from an unverified
+// WebSearch, was never checked against a real device, and Rob's own real
+// device testing (08-18) directly contradicted it: the keyboard vanished
+// after the placeholder was deleted. Telegram's own docs don't confirm
+// the "survives deletion" claim either way, and no real developer report
+// of this specific interaction (attach, then delete that exact message)
+// turned up anywhere searched -- see thinking-bubble/index.ts's header for
+// the full writeup and the actual fix (a never-deleted "permanent
+// carrier" message, tracked durably per chat, sent once ever). Do not
+// resurrect the "any deleted message is a safe carrier" assumption here.
 //
 // This plugin still ships and loads (openclaw.plugin.json, setup.sh) as
 // the canonical, curated definition of the button grid below --
@@ -1937,7 +1946,6 @@ export default definePluginEntry({
     // thinking-bubble/index.ts -- see this file's header comment for why.
   },
 });
-
 QUICKMENUPLUGINTS
 docker exec openclaw mkdir -p /data/workspace/.openclaw/extensions/quick-menu
 docker cp "$PLUGIN_DIR/openclaw.plugin.json" openclaw:/data/workspace/.openclaw/extensions/quick-menu/openclaw.plugin.json
