@@ -77,6 +77,67 @@
 // with a plain regex against the accumulated stdout+stderr text rather than
 // matching the decorative box border, which is cosmetic and not a stable
 // contract.
+//
+// --- Bare `/website` flow: inbound_claim researched and rejected (08-18) ---
+//
+// The product ask: bare `/website` should explain itself and wait for the
+// next message as input, like Nelita's /editvideo. The docs' own hooks
+// table names `inbound_claim` for exactly this ("Claim an inbound message
+// before agent routing"), so it was researched first, not guessed at.
+//
+// Static analysis of the shipped bundle (not just the docs) found the real
+// mechanism is much heavier than the one-line doc description implies: the
+// ONLY call site that invokes `inbound_claim` (dist/dispatch-*.js, the
+// `runInboundClaimForPluginOutcome` branch) is gated on
+// `if (pluginOwnedBinding)` -- it only fires for a plugin that already owns
+// a `PluginConversationBinding` for that conversation. The generic,
+// unscoped claim runner (`runInboundClaim`, first-claim-wins across all
+// plugins) exists in the hook runner but has zero callers anywhere in the
+// bundle. And winning a binding is itself a heavyweight, interactive flow
+// (`ctx.requestConversationBinding()`): the first request for a
+// conversation returns `status: "pending"` and sends the OWNER an approval
+// card ("plugin X wants to bind this conversation, approve?") unless a
+// prior "allow always" was already granted. Confirmed no bundled extension
+// in this build uses `inbound_claim` either. So the realistic behavior of
+// wiring it up here would be: the very first bare `/website` interrupts the
+// user with an unrelated approval prompt before they even get the
+// explanation -- worse than the current one-line usage hint, not an
+// upgrade. Rejected on that evidence; not registered.
+//
+// Fallback, per the same design note that anticipated this: use
+// `message_received` (proven live in thinking-bubble/index.ts) to notice
+// the next plain-text message after a bare `/website` and independently
+// generate+publish+reply to it. This hook is observation-only -- it cannot
+// stop the normal agent turn from *also* seeing that same plain text and
+// replying to it conversationally, since there's no special instruction in
+// front of the model telling it a command is mid-flow. That's a real,
+// visible degradation (the user may get two replies to one message: our
+// direct "Website published: ..." send, and a separate generic chat reply)
+// -- not something silently treated as equivalent to the win-the-race
+// language in the design brief. Flag this to whoever does the live Telegram
+// test; if it's too noisy in practice the next step would be chasing
+// `before_agent_run` (currently dead in this build, see thinking-bubble's
+// header) or asking upstream for an unscoped `inbound_claim` invocation.
+//
+// Sending the plugin's own reply out-of-band (independent of the normal
+// command-reply/`continueAgent` pipeline) requires the same direct-Telegram
+// pattern thinking-bubble already proved live, not OpenClaw's internal
+// `PluginRuntimeChannel` dispatch helpers (`dispatchReplyWithBufferedBlockDispatcher`
+// et al.) -- that surface has no bundled-extension usage example either and
+// is a much larger, riskier surface to get right untested than one more
+// `fetch()` call to the Bot API. Needs its own bot token in-process, same
+// as thinking-bubble: see `WEBSITE_BOT_TOKEN` in setup.sh's `.env` heredoc.
+//
+// HTML generation for the claimed follow-up message can't reuse
+// `ctx.runtimeContext.llm` (that only exists on `PluginCommandContext`,
+// which a hook handler never receives) -- it uses `api.runtime.llm.complete()`
+// instead, captured once at `register(api)` time. Per the shipped
+// `.d.ts`, `PluginRuntimeCore["llm"]` is the exact same type
+// `PluginCommandContext.runtimeContext.llm` is typed as, so this should be
+// the identical helper reached a different way -- plausible from the types,
+// NOT independently confirmed live the way the tool-call/command-context
+// findings above were (no owner Telegram access to trigger the claimed-message
+// path end to end; see verification notes in the repo).
 
 import http from "node:http";
 import crypto from "node:crypto";
@@ -86,6 +147,14 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 const COOKIE_NAME = "website_k";
 const TUNNEL_URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
 const TUNNEL_STARTUP_TIMEOUT_MS = 20_000;
+
+/** How long a bare `/website`'s "awaiting description" state stays claimable.
+ * Distinct concern from sitesBySessionKey's own no-timeout policy (that one
+ * governs how long a *published* site stays up -- explicit close_website
+ * only, by design, see header above). This is just "how long the mic stays
+ * open after I asked a question" -- a fixed few minutes is plenty; nobody
+ * describing a page they just asked to build takes longer than that. */
+const WEBSITE_AWAIT_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** toolCallId -> sessionKey, populated by the before_tool_call hook below and
  * consumed (and deleted) by the matching tool's execute(). This is the only
@@ -109,6 +178,14 @@ const pendingCreations = new Map();
  * oldest entry past this bound keeps it bounded without needing a TTL
  * timer. */
 const MAX_TRACKED_TOOL_CALLS = 50;
+
+/** sessionKey -> { since }. Set by a bare `/website`, consumed by the
+ * message_received handler below when the next plain-text message for that
+ * session arrives (claimed as the description), cleared early by any slash
+ * command for that session, and evicted past WEBSITE_AWAIT_TIMEOUT_MS. See
+ * header comment for why this is message_received-based rather than
+ * inbound_claim-based. */
+const awaitingDescriptionBySessionKey = new Map();
 
 function timingSafeTokenEqual(candidate, real) {
   if (typeof candidate !== "string" || typeof real !== "string" || !candidate || !real) return false;
@@ -328,11 +405,93 @@ const WEBSITE_COMMAND_SYSTEM_PROMPT =
   "(starting with <!DOCTYPE html> or <html>) -- no markdown code fences, no commentary before or " +
   "after. Inline all CSS and JS; do not reference external files or a build step.";
 
+/** Plain text, not markdown -- this goes through the normal command-reply
+ * pipeline, which nothing else in this file assumes renders markdown. */
+const WEBSITE_INTRO =
+  "Website: I build a real, live page from your description -- a dashboard, a form, a small " +
+  "internal tool, a landing page, whatever you can picture -- and publish it as a link you can " +
+  "open right now. No setup, no build step, just describe it.\n\n" +
+  "Send your description as your next message: what it should do, what it should show, how it " +
+  "should look if you care. I'll generate it and hand you the link.\n\n" +
+  "Already have a site open in this chat? A new description replaces it -- one live page per " +
+  "chat at a time.";
+
+/** Shared by the fast path (/website <description> in one message) and the
+ * claimed-follow-up path (message_received below): turn a description into
+ * raw HTML via whichever llm.complete() the caller has access to. */
+async function generateHtml(llm, description) {
+  const completion = await llm.complete({
+    messages: [{ role: "user", content: description }],
+    systemPrompt: WEBSITE_COMMAND_SYSTEM_PROMPT,
+    purpose: "website.command.generate",
+    maxTokens: 8192,
+    temperature: 0.4,
+  });
+  return stripCodeFence(completion.text ?? "");
+}
+
+/** Direct Telegram Bot API call -- the same pattern thinking-bubble/index.ts
+ * already proved live, used here because the message_received handler below
+ * has no return-value reply channel of its own (see header comment). */
+async function tg(botToken, method, body) {
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!json.ok) {
+    throw new Error(`Telegram ${method} failed: ${json.description ?? res.status}`);
+  }
+  return json;
+}
+
+/** Same extraction pattern as thinking-bubble/index.ts's extractChatId --
+ * message_received's real runtime event carries more candidate fields than
+ * its shipped .d.ts type does, hence the defensive fan-out rather than
+ * trusting a single typed field. */
+function extractChatId(event, ctx) {
+  const metadata = event.metadata ?? {};
+  const candidates = [
+    metadata.senderId,
+    event.chatId,
+    event.senderId,
+    ctx.chatId,
+    ctx.senderId,
+    ctx.channelContext?.chat?.id,
+  ];
+  for (const c of candidates) {
+    if (c !== undefined && c !== null && String(c).length > 0) return String(c);
+  }
+  return undefined;
+}
+
+function extractProvider(event, ctx) {
+  const metadata = event.metadata ?? {};
+  return metadata.provider ?? event.channel ?? ctx.messageProvider ?? ctx.channel;
+}
+
 export default definePluginEntry({
   id: "website",
   name: "Website",
   description: "Publish a self-contained HTML page as a live, token-gated website and close it when done.",
   register(api) {
+    // Lazily checking the timeout inside message_received (below) only
+    // evicts an awaiting-state entry when a follow-up message actually
+    // arrives for that session -- a bare `/website` nobody ever answers
+    // would otherwise sit in the Map forever. This sweep is what makes
+    // WEBSITE_AWAIT_TIMEOUT_MS an actual timeout rather than a check that
+    // only fires when it's already moot. unref() so it can't keep the
+    // process alive on its own.
+    setInterval(() => {
+      const now = Date.now();
+      for (const [sessionKey, awaiting] of awaitingDescriptionBySessionKey) {
+        if (now - awaiting.since > WEBSITE_AWAIT_TIMEOUT_MS) {
+          awaitingDescriptionBySessionKey.delete(sessionKey);
+        }
+      }
+    }, 60_000).unref();
+
     // Observation-only: stash the session key for this tool call so
     // execute() (which gets no context of its own) can look it up by
     // toolCallId. See header comment for why this is the mechanism, not
@@ -349,6 +508,79 @@ export default definePluginEntry({
         sessionKeyByToolCallId.set(event.toolCallId, ctx?.sessionKey ?? "global");
       }
     });
+
+    // Claims the next plain-text message after a bare `/website` as the
+    // description, generates+publishes it, and replies directly -- see the
+    // big header comment for why message_received (proven live) rather than
+    // inbound_claim (real but gated behind an owner-approval binding flow
+    // that doesn't fit this UX). Observation-only: cannot stop the model
+    // from also seeing and replying to this same message -- flagged, not
+    // hidden.
+    api.on(
+      "message_received",
+      async (event, ctx) => {
+        const sessionKey = event?.sessionKey ?? ctx?.sessionKey;
+        if (!sessionKey) return;
+
+        const awaiting = awaitingDescriptionBySessionKey.get(sessionKey);
+        if (!awaiting) return;
+
+        const text = typeof event?.content === "string" ? event.content.trim() : "";
+
+        // Any slash command -- /website again, /close, anything -- cancels
+        // the wait rather than being misread as a description.
+        if (text.startsWith("/")) {
+          awaitingDescriptionBySessionKey.delete(sessionKey);
+          return;
+        }
+
+        if (Date.now() - awaiting.since > WEBSITE_AWAIT_TIMEOUT_MS) {
+          awaitingDescriptionBySessionKey.delete(sessionKey);
+          return;
+        }
+
+        if (!text) return;
+
+        // Claim it now, before any await, so a duplicate/retried event for
+        // the same message can't double-fire this.
+        awaitingDescriptionBySessionKey.delete(sessionKey);
+
+        const provider = extractProvider(event ?? {}, ctx ?? {});
+        const chatId = extractChatId(event ?? {}, ctx ?? {});
+        const botToken = process.env.WEBSITE_BOT_TOKEN;
+        const llm = api.runtime?.llm;
+
+        if (provider !== "telegram" || !chatId || !botToken || !llm) {
+          console.error(
+            "[website] can't handle claimed follow-up description: missing telegram identity, bot token, or llm runtime",
+          );
+          return;
+        }
+
+        try {
+          const html = await generateHtml(llm, text);
+          const published = await publishForSession(sessionKey, html, text.slice(0, 80));
+          await tg(botToken, "sendMessage", {
+            chat_id: chatId,
+            text: `${published.reused ? "Website updated" : "Website published"}: ${published.url}`,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          try {
+            await tg(botToken, "sendMessage", {
+              chat_id: chatId,
+              text: `Couldn't build that page: ${message}`,
+            });
+          } catch (sendErr) {
+            console.error(
+              "[website] failed to report generation error to chat:",
+              sendErr instanceof Error ? sendErr.message : String(sendErr),
+            );
+          }
+        }
+      },
+      { priority: 10 },
+    );
 
     api.registerTool({
       name: "publish_website",
@@ -423,12 +655,23 @@ export default definePluginEntry({
       acceptsArgs: true,
       handler: async (ctx) => {
         const description = (ctx.args ?? "").trim();
+        const sessionKey = ctx.sessionKey ?? "global";
+
         if (!description) {
+          // Explain, then wait for the next message as input -- see header
+          // comment and WEBSITE_AWAIT_TIMEOUT_MS for the claiming mechanism
+          // and its timeout.
+          awaitingDescriptionBySessionKey.set(sessionKey, { since: Date.now() });
           return {
-            text: "Usage: /website <what you want the page to do or show>",
+            text: WEBSITE_INTRO,
             continueAgent: false,
           };
         }
+
+        // A real description arrived inline (the fast path) -- any stale
+        // awaiting-state from an earlier bare /website in this session no
+        // longer applies.
+        awaitingDescriptionBySessionKey.delete(sessionKey);
 
         const llm = ctx.runtimeContext?.llm;
         if (!llm) {
@@ -438,24 +681,15 @@ export default definePluginEntry({
           };
         }
 
-        let completion;
+        let html;
         try {
-          completion = await llm.complete({
-            messages: [{ role: "user", content: description }],
-            systemPrompt: WEBSITE_COMMAND_SYSTEM_PROMPT,
-            purpose: "website.command.generate",
-            maxTokens: 8192,
-            temperature: 0.4,
-          });
+          html = await generateHtml(llm, description);
         } catch (err) {
           return {
             text: `Couldn't generate that page: ${err instanceof Error ? err.message : String(err)}`,
             continueAgent: false,
           };
         }
-
-        const html = stripCodeFence(completion.text ?? "");
-        const sessionKey = ctx.sessionKey ?? "global";
 
         let published;
         try {
