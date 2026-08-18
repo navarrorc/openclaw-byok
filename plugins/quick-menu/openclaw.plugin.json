@@ -1,0 +1,14 @@
+{
+  "id": "quick-menu",
+  "name": "Quick Menu",
+  "description": "Sends a persistent Telegram custom keyboard of curated commands (including /website) once per session.",
+  "version": "1.0.0",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
