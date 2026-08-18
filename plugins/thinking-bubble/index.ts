@@ -95,7 +95,7 @@ function settleStuckPlaceholder(botToken: string, placeholder: Placeholder) {
 
 function placeholderText(): string {
   const label = process.env.THINKING_BUBBLE_MODEL_LABEL;
-  return label ? `🧠 ${label} …` : "…";
+  return label ? `🧠 ${label} <i>thinking</i>` : "<i>thinking</i>";
 }
 
 async function tg(botToken: string, method: string, body: Record<string, unknown>) {
@@ -190,6 +190,7 @@ export default definePluginEntry({
           const sent = await tg(botToken, "sendMessage", {
             chat_id: chatId,
             text: placeholderText(),
+            parse_mode: "HTML",
           });
           const messageId = sent.result?.message_id;
           if (typeof messageId === "number") {
