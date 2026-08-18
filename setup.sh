@@ -1720,12 +1720,6 @@ cat > "$PLUGIN_DIR/openclaw.plugin.json" <<'QUICKMENUPLUGINJSON'
   "name": "Quick Menu",
   "description": "Sends the curated Telegram quick-menu keyboard as a standalone, permanent message on /start and /new -- matching FarmOps' proven pattern of never attaching reply_markup to a message that gets deleted or edited. Also provides /clearchat.",
   "version": "1.0.0",
-  "commandAliases": [
-    {
-      "name": "clearchat",
-      "kind": "runtime-slash"
-    }
-  ],
   "activation": {
     "onStartup": true
   },
@@ -1828,6 +1822,51 @@ cat > "$PLUGIN_DIR/index.ts" <<'QUICKMENUPLUGINTS'
 // buttons crossed out): that feature isn't ready for a button yet. /clearchat
 // and the location-share button take its place -- see their own sections
 // below for how each works.
+//
+// --- /clearchat: real root cause, found live (08-18) ---
+//
+// /clearchat originally used `api.registerCommand`, same as /website. Live
+// testing kept reproducing "Command not found." even after redeploys that
+// should have fixed it. Traced into OpenClaw's own compiled source
+// (dist/telegram-ingress-spool-*.js ~1357-1377, dist/commands-CjgJ-luM.js
+// matchPluginCommand, dist/command-registration-tKF3dsKu.js registerPluginCommand)
+// to find the real mechanism: grammy's bot.command() routing table is built
+// ONCE at Telegram startup from a snapshot of the live plugin-command
+// registry (getPluginCommandSpecs -> the same process-wide `pluginCommands`
+// Map singleton, confirmed via Symbol.for("openclaw.pluginCommandsState") --
+// not a per-module copy). But the handler that snapshot wires up does a
+// SECOND, independent lookup against that same live Map at message time
+// (matchPluginCommand). Between those two reads, anything that mutates that
+// same singleton can make grammy's wired-up route point at a registry that
+// no longer has the command. Confirmed at least two distinct ways this can
+// happen in the compiled source, not narrowed down to one: (a) if plugin
+// activation is ever re-entered and quick-menu's `register()` fails on that
+// later call, the catch path's `rollbackPluginGlobalSideEffects` (dist/
+// loader-D8d2EvVh.js ~2274) calls `clearPluginCommandsForPlugin` (dist/
+// registry-B8eQDFB4.js ~4790), wiping the entry a prior successful run
+// installed; (b) a plugin-registry CACHE hit on a later `loadOpenClawPlugins`
+// call runs `restorePluginCommands` (dist/command-registration-tKF3dsKu.js
+// ~69-76), which unconditionally clears the live Map and rebuilds it from
+// an older snapshot, no exception required at all. Either way, `api.
+// registerCommand`'s void return (confirmed in dist/types-*.d.ts) gives the
+// plugin no way to see any of this happen. `/website`'s own command hasn't
+// shown this symptom, but it's the exact same registration path and the
+// exact same shared registry -- there is nothing website-specific
+// protecting it, just luck of timing so far.
+//
+// Fix: stop depending on that registry entirely for this command. Detect
+// the literal "/clearchat" text via `message_received` instead -- the same
+// hook /start and /new already use below, proven reliable all day -- and
+// run the clear-chat logic directly, bypassing native command dispatch (and
+// its "Command not found." fallback) completely. No more `api.registerCommand`
+// call for clearchat, so grammy never wires up a route for it that could
+// point at an emptied registry. Same tradeoff /website's own header already
+// accepts for its bare-command follow-up flow: message_received can't stop
+// the normal agent turn from also seeing "/clearchat" as plain text, so a
+// stray conversational reply after the clear-confirmation is possible. That
+// didn't matter for /new (a real native built-in command that properly
+// suppresses the agent turn) but does apply here, since /clearchat has no
+// native counterpart to piggyback on. Flagged, not hidden -- see report.
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
@@ -1871,6 +1910,14 @@ function isStartCommand(content: string): boolean {
 /** Matches bare "/new" and the "/new@BotName" group-chat form. */
 function isNewCommand(content: string): boolean {
   return /^\/new(@\w+)?(\s|$)/.test(content);
+}
+
+/** Matches bare "/clearchat" and the "/clearchat@BotName" group-chat form.
+ * No args accepted (matching the old registerCommand's acceptsArgs: false) --
+ * anything after the command word just fails this match and falls through
+ * to normal handling, same as before. */
+function isClearChatCommand(content: string): boolean {
+  return /^\/clearchat(@\w+)?\s*$/.test(content);
 }
 
 const START_KEYBOARD_TEXT = "👋 Quick menu ready -- tap the icon beside the message box anytime.";
@@ -1945,6 +1992,11 @@ function extractProvider(event: Record<string, unknown>, ctx: Record<string, unk
 // Purely visual chat cleanup -- does NOT reset the agent's own
 // conversation/session state, which is what /new (already a separate real
 // OpenClaw command) is for.
+//
+// Triggered from message_received (see header's "real root cause" section
+// for why this isn't api.registerCommand), so this is a plain function
+// called directly from that hook, not a PluginCommandContext handler --
+// takes botToken/chatId straight, no ctx to unpack.
 const CLEARCHAT_DEPTH = 300;
 const CLEARCHAT_TEXT = "✅ chat cleared. /clearchat to clear again.";
 
@@ -1972,6 +2024,25 @@ async function bulkDeleteMessages(botToken: string, chatId: string, ids: number[
   }
 }
 
+async function performClearChat(botToken: string, chatId: string): Promise<void> {
+  let newest: number | undefined;
+  try {
+    const sent = await tg(botToken, "sendMessage", {
+      chat_id: chatId,
+      text: CLEARCHAT_TEXT,
+      reply_markup: QUICK_MENU_KEYBOARD,
+    });
+    newest = (sent as { result?: { message_id?: number } }).result?.message_id;
+  } catch (err) {
+    console.error("[quick-menu] clearchat: failed to send confirmation:", err instanceof Error ? err.message : String(err));
+    return;
+  }
+
+  if (typeof newest === "number") {
+    await bulkDeleteMessages(botToken, chatId, clearChatIds(newest, CLEARCHAT_DEPTH));
+  }
+}
+
 export default definePluginEntry({
   id: "quick-menu",
   name: "Quick Menu",
@@ -1992,6 +2063,15 @@ export default definePluginEntry({
           ? (event as { content: string }).content.trim()
           : "";
 
+        if (isClearChatCommand(content)) {
+          try {
+            await performClearChat(botToken, chatId);
+          } catch (err) {
+            console.error("[quick-menu] clearchat: unexpected failure:", err instanceof Error ? err.message : String(err));
+          }
+          return;
+        }
+
         let text: string | undefined;
         if (isStartCommand(content)) text = START_KEYBOARD_TEXT;
         else if (isNewCommand(content)) text = NEW_KEYBOARD_TEXT;
@@ -2010,53 +2090,14 @@ export default definePluginEntry({
       { priority: 10 },
     );
 
-    // Deterministic (not LLM-driven), matching how /website already works
-    // (plugins/website/index.ts's own registerCommand) -- see the
-    // CLEARCHAT_* section above for the full mechanism.
-    api.registerCommand({
-      name: "clearchat",
-      description: "Clear this chat's visible history. Does not reset the agent's conversation -- use /new for that.",
-      acceptsArgs: false,
-      handler: async (ctx) => {
-        const c = ctx as { senderId?: string; from?: string; channelId?: string };
-        const botToken = process.env.QUICK_MENU_BOT_TOKEN;
-        const chatId = c.senderId ?? c.from;
-        // channelId is only checked when present -- PluginCommandContext's
-        // shipped .d.ts marks it optional, and this product is single-
-        // provider (Telegram) anyway, so an absent value shouldn't block a
-        // real chatId+botToken from working.
-        if (!botToken || !chatId || (c.channelId && c.channelId !== "telegram")) {
-          return {
-            text: "Can't clear chat right now (missing Telegram identity or bot token).",
-            continueAgent: false,
-          };
-        }
-
-        let newest: number | undefined;
-        try {
-          const sent = await tg(botToken, "sendMessage", {
-            chat_id: chatId,
-            text: CLEARCHAT_TEXT,
-            reply_markup: QUICK_MENU_KEYBOARD,
-          });
-          newest = (sent as { result?: { message_id?: number } }).result?.message_id;
-        } catch (err) {
-          console.error("[quick-menu] clearchat: failed to send confirmation:", err instanceof Error ? err.message : String(err));
-          return {
-            text: "Couldn't clear the chat right now -- try again in a moment.",
-            continueAgent: false,
-          };
-        }
-
-        if (typeof newest === "number") {
-          await bulkDeleteMessages(botToken, chatId, clearChatIds(newest, CLEARCHAT_DEPTH));
-        }
-
-        // The confirmation sent above already IS the reply -- suppress the
-        // normal command-reply pipeline so nothing sends a second message.
-        return { continueAgent: false, suppressReply: true };
-      },
-    });
+    // Permanent, low-noise proof this plugin's message_received-driven
+    // commands (start/new/clearchat keyboard triggers) are actually wired up
+    // at startup -- cheap insurance after a debugging session that spent
+    // hours unable to trust api.registerCommand's silent-void registration
+    // path for exactly this kind of confirmation. If this line is missing
+    // from `docker logs openclaw` after a boot, quick-menu's register()
+    // itself didn't run to completion.
+    console.log("[quick-menu] message_received triggers registered: /start, /new, /clearchat (keyboard sender)");
   },
 });
 QUICKMENUPLUGINTS

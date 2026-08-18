@@ -3,12 +3,6 @@
   "name": "Quick Menu",
   "description": "Sends the curated Telegram quick-menu keyboard as a standalone, permanent message on /start and /new -- matching FarmOps' proven pattern of never attaching reply_markup to a message that gets deleted or edited. Also provides /clearchat.",
   "version": "1.0.0",
-  "commandAliases": [
-    {
-      "name": "clearchat",
-      "kind": "runtime-slash"
-    }
-  ],
   "activation": {
     "onStartup": true
   },
