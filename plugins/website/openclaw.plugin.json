@@ -1,0 +1,17 @@
+{
+  "id": "website",
+  "name": "Website",
+  "description": "Publish a self-contained HTML page the agent builds as a live, token-gated website reachable from Telegram (via a Cloudflare Quick Tunnel), and close it when done.",
+  "version": "1.0.0",
+  "contracts": {
+    "tools": ["publish_website", "close_website"]
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
