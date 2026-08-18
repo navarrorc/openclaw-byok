@@ -639,6 +639,17 @@ function extractSessionKey(event: Record<string, unknown>, ctx: Record<string, u
   );
 }
 
+/** message_received's event carries Telegram's own message send time (ms
+ * since epoch, confirmed live 08-18 via dispatch source: ctx.Timestamp is
+ * set from `msg.date * 1000` and flows through unchanged to the plugin
+ * event's `timestamp` field). Diffing against it gives an exact,
+ * self-contained placeholder-latency measurement -- no more guessing at the
+ * gap from gateway log timestamps of unrelated lines. */
+function extractTimestamp(event: Record<string, unknown>): number | undefined {
+  const t = (event as { timestamp?: number }).timestamp;
+  return typeof t === "number" ? t : undefined;
+}
+
 export default definePluginEntry({
   id: "thinking-bubble",
   name: "Thinking Bubble",
@@ -671,6 +682,22 @@ export default definePluginEntry({
 
         if (!botToken) return;
 
+        // Slash commands (OpenClaw built-ins, this product's own /website,
+        // and quick-menu's keyboard shortcuts -- all literally /-prefixed
+        // text, see plugins/quick-menu/index.ts) are answered instantly by
+        // a non-agent path that never fires reply_payload_sending, so a
+        // placeholder sent here would either orphan forever or get caught
+        // by the stuck-placeholder safety net and wrongly edited to a
+        // "didn't come through" retry notice next to a reply that already
+        // arrived fine. Categorical skip, not a per-command allowlist --
+        // Rob, 08-18: "when /commands are being executed... we should not
+        // use or display the thinking bubble... The bubble would only come
+        // when there's an LLM involved."
+        const content = typeof (event as { content?: unknown }).content === "string"
+          ? (event as { content: string }).content.trim()
+          : "";
+        if (content.startsWith("/")) return;
+
         const provider = extractProvider(event as Record<string, unknown>, ctx);
         const chatId = extractChatId(event as Record<string, unknown>, ctx);
         const sessionKey = extractSessionKey(event as Record<string, unknown>, ctx);
@@ -678,11 +705,15 @@ export default definePluginEntry({
         if (provider !== "telegram" || !chatId || !sessionKey) return;
 
         try {
+          const inboundTimestamp = extractTimestamp(event as Record<string, unknown>);
           const sent = await tg(botToken, "sendMessage", {
             chat_id: chatId,
             text: placeholderText(),
             parse_mode: "HTML",
           });
+          if (typeof inboundTimestamp === "number") {
+            console.log(`[thinking-bubble] placeholder sent ${Date.now() - inboundTimestamp}ms after inbound message`);
+          }
           const messageId = sent.result?.message_id;
           if (typeof messageId === "number") {
             // A prior placeholder still tracked for this session was never
