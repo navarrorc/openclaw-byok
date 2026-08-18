@@ -55,9 +55,23 @@
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
-type Placeholder = { chatId: string; messageId: number };
+type Placeholder = { chatId: string; messageId: number; since: number };
 
 const pendingBySession = new Map<string, Placeholder>();
+
+/** Safety net for a confirmed OpenClaw platform quirk (live 08-18, both
+ * before and after TTS config changes, on plain "Hi" messages): the model
+ * call succeeds but the turn dispatches with zero queued reply payloads --
+ * [turn/kernel] logs it, no error is thrown anywhere. reply_payload_sending
+ * simply never fires for that turn, so without this the placeholder from
+ * message_received sits there forever with no indication anything failed.
+ * Not our bug to fix (nothing in our plugin code drops the payload), but our
+ * bubble needs to resolve either way. 3 minutes is comfortably past any
+ * legitimate turn -- including ones with tool calls or slow providers --
+ * while still turning "stuck forever" into "stuck for a few minutes, then a
+ * clear message telling the user to retry". Same style of constant as
+ * WEBSITE_AWAIT_TIMEOUT_MS in plugins/website/index.ts. */
+const PLACEHOLDER_TIMEOUT_MS = 3 * 60 * 1000;
 
 function placeholderText(): string {
   const label = process.env.THINKING_BUBBLE_MODEL_LABEL;
@@ -119,6 +133,35 @@ export default definePluginEntry({
   name: "Thinking Bubble",
   description: "Send a placeholder Telegram message while a reply generates, then delete it once the real answer is about to arrive.",
   register(api) {
+    // Sweeps for placeholders whose owning turn never called
+    // reply_payload_sending (see PLACEHOLDER_TIMEOUT_MS comment above).
+    // Same shape as the website plugin's awaitingDescriptionBySessionKey
+    // eviction sweep: unref() so it can't keep the process alive on its own,
+    // and it's the only thing that makes the timeout apply even when no
+    // later event ever arrives for that session to trigger a lazy check.
+    setInterval(() => {
+      const botToken = process.env.THINKING_BUBBLE_BOT_TOKEN;
+      if (!botToken) return;
+
+      const now = Date.now();
+      for (const [sessionKey, placeholder] of pendingBySession) {
+        if (now - placeholder.since <= PLACEHOLDER_TIMEOUT_MS) continue;
+
+        pendingBySession.delete(sessionKey); // evict first: don't act twice on the same placeholder
+
+        tg(botToken, "editMessageText", {
+          chat_id: placeholder.chatId,
+          message_id: placeholder.messageId,
+          text: "That one didn't come through -- try sending it again.",
+        }).catch((err) => {
+          console.error(
+            "[thinking-bubble] failed to edit stuck placeholder:",
+            err instanceof Error ? err.message : String(err),
+          );
+        });
+      }
+    }, 30_000).unref();
+
     api.on(
       "message_received",
       async (event) => {
@@ -140,7 +183,7 @@ export default definePluginEntry({
           });
           const messageId = sent.result?.message_id;
           if (typeof messageId === "number") {
-            pendingBySession.set(sessionKey, { chatId, messageId });
+            pendingBySession.set(sessionKey, { chatId, messageId, since: Date.now() });
           }
         } catch (err) {
           console.error("[thinking-bubble] failed to send placeholder:", err instanceof Error ? err.message : String(err));
