@@ -84,26 +84,31 @@
 // of the button grid -- not duplicated elsewhere anymore now that
 // thinking-bubble's placeholder has gone back to carrying zero keyboard
 // logic (see that file's header for its own, much shorter, note about this).
+//
+// TTS row removed (product owner, 08-18, live screenshot with the three TTS
+// buttons crossed out): that feature isn't ready for a button yet. /clearchat
+// and the location-share button take its place -- see their own sections
+// below for how each works.
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 /** 2-per-row grid, matching FarmOps' own keyboard shape. `/website` and
  * `/new` lead (this product's headline feature, then the most common
- * reset action); TTS gets both toggles plus a status button, not just a
- * read-only check, since the product owner is actively exploring that
- * feature; `/usage cost` and `/status` close out discovery, `/help` is
- * the fallback. Deliberately `/usage cost`, not bare `/usage` -- per
+ * reset action); `/clearchat` and `/usage cost` next, `/status`/`/help`
+ * close out discovery. The location-share button trails alone (odd count)
+ * since it's not a slash command, just a `request_location` tap target.
+ * Deliberately `/usage cost`, not bare `/usage` -- per
  * docs/concepts/usage-tracking.md, bare `/usage` CYCLES the per-response
  * footer mode (off -> tokens -> full -> off) on every invocation, so a
  * button sending it would do something different each tap depending on
  * hidden prior state. `/usage cost` is a stable, idempotent local cost
  * summary -- the actual "check my spend" behavior a BYOK customer wants
  * from a button, not a footer-verbosity toggle. */
-export const KEYBOARD_ROWS: { text: string }[][] = [
+export const KEYBOARD_ROWS: ({ text: string; request_location?: boolean })[][] = [
   [{ text: "/website" }, { text: "/new" }],
-  [{ text: "/tts on" }, { text: "/tts off" }],
-  [{ text: "/tts status" }, { text: "/usage cost" }],
+  [{ text: "/clearchat" }, { text: "/usage cost" }],
   [{ text: "/status" }, { text: "/help" }],
+  [{ text: "📍 Share Location", request_location: true }],
 ];
 
 /** `resize_keyboard` shrinks the keyboard to fit its buttons instead of
@@ -171,6 +176,63 @@ function extractProvider(event: Record<string, unknown>, ctx: Record<string, unk
   );
 }
 
+// --- /clearchat ---
+//
+// Matches FarmOps' clear_chat exactly (ai-farm/scripts/bridge_common.py:
+// 376-421, read-only reference, not touched). Telegram has no "list chat
+// history" API, so there's no way to know which message ids exist. The
+// trick: send the confirmation FIRST, with its FINAL text (not a
+// "clearing..." placeholder edited after -- FarmOps' own 07-25 post-mortem
+// found a stuck "clearing..." reads as a dead message) -- the id Telegram
+// hands back for that send IS the newest id in the chat, since ids are
+// sequential per chat. Then walk backward CLEARCHAT_DEPTH ids and bulk-
+// delete via deleteMessages (Telegram's 100-id-per-call max), falling back
+// to individual deleteMessage calls -- run concurrently, not sequentially,
+// so a sparse/short chat (mostly-nonexistent ids) doesn't stall on 100
+// serial round-trips -- if a batch is rejected. Ids that don't exist,
+// already deleted, or are >48h old are silently skipped by Telegram itself;
+// no local id tracking needed.
+//
+// The confirmation is deliberately NEVER deleted (excluded from the walked
+// range) -- FarmOps found live that a fully empty chat drops Telegram back
+// to its "never started" view, forcing a fresh Start tap before the
+// keyboard reappears. It carries QUICK_MENU_KEYBOARD directly (the same
+// direct-Telegram-API send /start and /new use above) since
+// editMessageText's reply_markup can't attach a custom ReplyKeyboardMarkup
+// -- only the original sendMessage can, and deleting an earlier
+// keyboard-carrying message was found (FarmOps, 07-25) to drop the keyboard
+// from the client entirely, so it has to be re-asserted here every time.
+//
+// Purely visual chat cleanup -- does NOT reset the agent's own
+// conversation/session state, which is what /new (already a separate real
+// OpenClaw command) is for.
+const CLEARCHAT_DEPTH = 300;
+const CLEARCHAT_TEXT = "✅ chat cleared. /clearchat to clear again.";
+
+function clearChatIds(newestId: number, depth: number): number[] {
+  const stop = Math.max(newestId - depth, 0);
+  const ids: number[] = [];
+  for (let id = newestId - 1; id > stop; id--) ids.push(id);
+  return ids;
+}
+
+async function bulkDeleteMessages(botToken: string, chatId: string, ids: number[]): Promise<void> {
+  for (let i = 0; i < ids.length; i += 100) {
+    const batch = ids.slice(i, i + 100);
+    try {
+      await tg(botToken, "deleteMessages", { chat_id: chatId, message_ids: batch });
+    } catch (err) {
+      console.error(
+        "[quick-menu] clearchat: deleteMessages batch rejected, falling back to individual deletes:",
+        err instanceof Error ? err.message : String(err),
+      );
+      await Promise.all(
+        batch.map((id) => tg(botToken, "deleteMessage", { chat_id: chatId, message_id: id }).catch(() => {})),
+      );
+    }
+  }
+}
+
 export default definePluginEntry({
   id: "quick-menu",
   name: "Quick Menu",
@@ -208,5 +270,53 @@ export default definePluginEntry({
       },
       { priority: 10 },
     );
+
+    // Deterministic (not LLM-driven), matching how /website already works
+    // (plugins/website/index.ts's own registerCommand) -- see the
+    // CLEARCHAT_* section above for the full mechanism.
+    api.registerCommand({
+      name: "clearchat",
+      description: "Clear this chat's visible history. Does not reset the agent's conversation -- use /new for that.",
+      acceptsArgs: false,
+      handler: async (ctx) => {
+        const c = ctx as { senderId?: string; from?: string; channelId?: string };
+        const botToken = process.env.QUICK_MENU_BOT_TOKEN;
+        const chatId = c.senderId ?? c.from;
+        // channelId is only checked when present -- PluginCommandContext's
+        // shipped .d.ts marks it optional, and this product is single-
+        // provider (Telegram) anyway, so an absent value shouldn't block a
+        // real chatId+botToken from working.
+        if (!botToken || !chatId || (c.channelId && c.channelId !== "telegram")) {
+          return {
+            text: "Can't clear chat right now (missing Telegram identity or bot token).",
+            continueAgent: false,
+          };
+        }
+
+        let newest: number | undefined;
+        try {
+          const sent = await tg(botToken, "sendMessage", {
+            chat_id: chatId,
+            text: CLEARCHAT_TEXT,
+            reply_markup: QUICK_MENU_KEYBOARD,
+          });
+          newest = (sent as { result?: { message_id?: number } }).result?.message_id;
+        } catch (err) {
+          console.error("[quick-menu] clearchat: failed to send confirmation:", err instanceof Error ? err.message : String(err));
+          return {
+            text: "Couldn't clear the chat right now -- try again in a moment.",
+            continueAgent: false,
+          };
+        }
+
+        if (typeof newest === "number") {
+          await bulkDeleteMessages(botToken, chatId, clearChatIds(newest, CLEARCHAT_DEPTH));
+        }
+
+        // The confirmation sent above already IS the reply -- suppress the
+        // normal command-reply pipeline so nothing sends a second message.
+        return { continueAgent: false, suppressReply: true };
+      },
+    });
   },
 });

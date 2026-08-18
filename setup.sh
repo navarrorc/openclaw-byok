@@ -269,6 +269,7 @@ THINKING_BUBBLE_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
 THINKING_BUBBLE_MODEL_LABEL=${MODEL_DISPLAY_NAME:-}
 WEBSITE_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
 QUICK_MENU_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+LOCATION_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
 EOF
 chmod 600 "$OPENCLAW_DIR/.env"
 chown "$OPENCLAW_USER:$OPENCLAW_USER" "$OPENCLAW_DIR/.env"
@@ -1705,6 +1706,10 @@ rm -rf "$PLUGIN_DIR"
 #      deleted or edited. See quick-menu/index.ts's header for the full
 #      history of why the two prior designs (a standalone announcement,
 #      then piggybacking on thinking-bubble's placeholder) didn't work.
+#      Also registers the real, deterministic /clearchat command (matching
+#      FarmOps' clear_chat) and no longer includes the TTS buttons the
+#      product owner asked removed (08-18) -- see quick-menu/index.ts's
+#      header for both.
 # ---------------------------------------------------------------------------
 log "Installing the quick-menu plugin"
 PLUGIN_DIR=/tmp/openclaw-quick-menu
@@ -1713,8 +1718,14 @@ cat > "$PLUGIN_DIR/openclaw.plugin.json" <<'QUICKMENUPLUGINJSON'
 {
   "id": "quick-menu",
   "name": "Quick Menu",
-  "description": "Sends the curated Telegram quick-menu keyboard as a standalone, permanent message on /start and /new -- matching FarmOps' proven pattern of never attaching reply_markup to a message that gets deleted or edited.",
+  "description": "Sends the curated Telegram quick-menu keyboard as a standalone, permanent message on /start and /new -- matching FarmOps' proven pattern of never attaching reply_markup to a message that gets deleted or edited. Also provides /clearchat.",
   "version": "1.0.0",
+  "commandAliases": [
+    {
+      "name": "clearchat",
+      "kind": "runtime-slash"
+    }
+  ],
   "activation": {
     "onStartup": true
   },
@@ -1812,26 +1823,31 @@ cat > "$PLUGIN_DIR/index.ts" <<'QUICKMENUPLUGINTS'
 // of the button grid -- not duplicated elsewhere anymore now that
 // thinking-bubble's placeholder has gone back to carrying zero keyboard
 // logic (see that file's header for its own, much shorter, note about this).
+//
+// TTS row removed (product owner, 08-18, live screenshot with the three TTS
+// buttons crossed out): that feature isn't ready for a button yet. /clearchat
+// and the location-share button take its place -- see their own sections
+// below for how each works.
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 /** 2-per-row grid, matching FarmOps' own keyboard shape. `/website` and
  * `/new` lead (this product's headline feature, then the most common
- * reset action); TTS gets both toggles plus a status button, not just a
- * read-only check, since the product owner is actively exploring that
- * feature; `/usage cost` and `/status` close out discovery, `/help` is
- * the fallback. Deliberately `/usage cost`, not bare `/usage` -- per
+ * reset action); `/clearchat` and `/usage cost` next, `/status`/`/help`
+ * close out discovery. The location-share button trails alone (odd count)
+ * since it's not a slash command, just a `request_location` tap target.
+ * Deliberately `/usage cost`, not bare `/usage` -- per
  * docs/concepts/usage-tracking.md, bare `/usage` CYCLES the per-response
  * footer mode (off -> tokens -> full -> off) on every invocation, so a
  * button sending it would do something different each tap depending on
  * hidden prior state. `/usage cost` is a stable, idempotent local cost
  * summary -- the actual "check my spend" behavior a BYOK customer wants
  * from a button, not a footer-verbosity toggle. */
-export const KEYBOARD_ROWS: { text: string }[][] = [
+export const KEYBOARD_ROWS: ({ text: string; request_location?: boolean })[][] = [
   [{ text: "/website" }, { text: "/new" }],
-  [{ text: "/tts on" }, { text: "/tts off" }],
-  [{ text: "/tts status" }, { text: "/usage cost" }],
+  [{ text: "/clearchat" }, { text: "/usage cost" }],
   [{ text: "/status" }, { text: "/help" }],
+  [{ text: "📍 Share Location", request_location: true }],
 ];
 
 /** `resize_keyboard` shrinks the keyboard to fit its buttons instead of
@@ -1899,6 +1915,63 @@ function extractProvider(event: Record<string, unknown>, ctx: Record<string, unk
   );
 }
 
+// --- /clearchat ---
+//
+// Matches FarmOps' clear_chat exactly (ai-farm/scripts/bridge_common.py:
+// 376-421, read-only reference, not touched). Telegram has no "list chat
+// history" API, so there's no way to know which message ids exist. The
+// trick: send the confirmation FIRST, with its FINAL text (not a
+// "clearing..." placeholder edited after -- FarmOps' own 07-25 post-mortem
+// found a stuck "clearing..." reads as a dead message) -- the id Telegram
+// hands back for that send IS the newest id in the chat, since ids are
+// sequential per chat. Then walk backward CLEARCHAT_DEPTH ids and bulk-
+// delete via deleteMessages (Telegram's 100-id-per-call max), falling back
+// to individual deleteMessage calls -- run concurrently, not sequentially,
+// so a sparse/short chat (mostly-nonexistent ids) doesn't stall on 100
+// serial round-trips -- if a batch is rejected. Ids that don't exist,
+// already deleted, or are >48h old are silently skipped by Telegram itself;
+// no local id tracking needed.
+//
+// The confirmation is deliberately NEVER deleted (excluded from the walked
+// range) -- FarmOps found live that a fully empty chat drops Telegram back
+// to its "never started" view, forcing a fresh Start tap before the
+// keyboard reappears. It carries QUICK_MENU_KEYBOARD directly (the same
+// direct-Telegram-API send /start and /new use above) since
+// editMessageText's reply_markup can't attach a custom ReplyKeyboardMarkup
+// -- only the original sendMessage can, and deleting an earlier
+// keyboard-carrying message was found (FarmOps, 07-25) to drop the keyboard
+// from the client entirely, so it has to be re-asserted here every time.
+//
+// Purely visual chat cleanup -- does NOT reset the agent's own
+// conversation/session state, which is what /new (already a separate real
+// OpenClaw command) is for.
+const CLEARCHAT_DEPTH = 300;
+const CLEARCHAT_TEXT = "✅ chat cleared. /clearchat to clear again.";
+
+function clearChatIds(newestId: number, depth: number): number[] {
+  const stop = Math.max(newestId - depth, 0);
+  const ids: number[] = [];
+  for (let id = newestId - 1; id > stop; id--) ids.push(id);
+  return ids;
+}
+
+async function bulkDeleteMessages(botToken: string, chatId: string, ids: number[]): Promise<void> {
+  for (let i = 0; i < ids.length; i += 100) {
+    const batch = ids.slice(i, i + 100);
+    try {
+      await tg(botToken, "deleteMessages", { chat_id: chatId, message_ids: batch });
+    } catch (err) {
+      console.error(
+        "[quick-menu] clearchat: deleteMessages batch rejected, falling back to individual deletes:",
+        err instanceof Error ? err.message : String(err),
+      );
+      await Promise.all(
+        batch.map((id) => tg(botToken, "deleteMessage", { chat_id: chatId, message_id: id }).catch(() => {})),
+      );
+    }
+  }
+}
+
 export default definePluginEntry({
   id: "quick-menu",
   name: "Quick Menu",
@@ -1936,12 +2009,324 @@ export default definePluginEntry({
       },
       { priority: 10 },
     );
+
+    // Deterministic (not LLM-driven), matching how /website already works
+    // (plugins/website/index.ts's own registerCommand) -- see the
+    // CLEARCHAT_* section above for the full mechanism.
+    api.registerCommand({
+      name: "clearchat",
+      description: "Clear this chat's visible history. Does not reset the agent's conversation -- use /new for that.",
+      acceptsArgs: false,
+      handler: async (ctx) => {
+        const c = ctx as { senderId?: string; from?: string; channelId?: string };
+        const botToken = process.env.QUICK_MENU_BOT_TOKEN;
+        const chatId = c.senderId ?? c.from;
+        // channelId is only checked when present -- PluginCommandContext's
+        // shipped .d.ts marks it optional, and this product is single-
+        // provider (Telegram) anyway, so an absent value shouldn't block a
+        // real chatId+botToken from working.
+        if (!botToken || !chatId || (c.channelId && c.channelId !== "telegram")) {
+          return {
+            text: "Can't clear chat right now (missing Telegram identity or bot token).",
+            continueAgent: false,
+          };
+        }
+
+        let newest: number | undefined;
+        try {
+          const sent = await tg(botToken, "sendMessage", {
+            chat_id: chatId,
+            text: CLEARCHAT_TEXT,
+            reply_markup: QUICK_MENU_KEYBOARD,
+          });
+          newest = (sent as { result?: { message_id?: number } }).result?.message_id;
+        } catch (err) {
+          console.error("[quick-menu] clearchat: failed to send confirmation:", err instanceof Error ? err.message : String(err));
+          return {
+            text: "Couldn't clear the chat right now -- try again in a moment.",
+            continueAgent: false,
+          };
+        }
+
+        if (typeof newest === "number") {
+          await bulkDeleteMessages(botToken, chatId, clearChatIds(newest, CLEARCHAT_DEPTH));
+        }
+
+        // The confirmation sent above already IS the reply -- suppress the
+        // normal command-reply pipeline so nothing sends a second message.
+        return { continueAgent: false, suppressReply: true };
+      },
+    });
   },
 });
 QUICKMENUPLUGINTS
 docker exec openclaw mkdir -p /data/workspace/.openclaw/extensions/quick-menu
 docker cp "$PLUGIN_DIR/openclaw.plugin.json" openclaw:/data/workspace/.openclaw/extensions/quick-menu/openclaw.plugin.json
 docker cp "$PLUGIN_DIR/index.ts" openclaw:/data/workspace/.openclaw/extensions/quick-menu/index.ts
+rm -rf "$PLUGIN_DIR"
+
+# ---------------------------------------------------------------------------
+# 7a5. Install the "location" plugin — lets the user share their Telegram
+#      location via the quick-menu's "Share Location" button and injects it
+#      as short-lived context into subsequent turns, matching Nelita's
+#      location-sharing behavior (nelita_bridge.py, read-only reference).
+#      See location/index.ts's header for the full mechanism, including the
+#      real OpenClaw platform limitations this ran into (no structured
+#      location field in the message_received hook payload -- only the
+#      flattened "📍 lat, lon" text; Live Location repeat ticks never reach
+#      plugin hooks at all) and how it was verified against those limits.
+# ---------------------------------------------------------------------------
+log "Installing the location plugin"
+PLUGIN_DIR=/tmp/openclaw-location
+mkdir -p "$PLUGIN_DIR"
+cat > "$PLUGIN_DIR/openclaw.plugin.json" <<'LOCATIONPLUGINJSON'
+{
+  "id": "location",
+  "name": "Location",
+  "description": "Lets the user share their Telegram location via the quick-menu button and injects it as short-lived context into subsequent turns, matching Nelita's location-sharing behavior.",
+  "version": "1.0.0",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
+LOCATIONPLUGINJSON
+cat > "$PLUGIN_DIR/index.ts" <<'LOCATIONPLUGINTS'
+// Location plugin
+//
+// Matches Nelita's location-sharing behavior (nelita_bridge.py, read-only
+// reference, not touched): a "📍 Share Location" keyboard button (defined
+// in plugins/quick-menu/index.ts's KEYBOARD_ROWS -- this plugin doesn't own
+// the keyboard) lets the user hand over their coordinates once, this plugin
+// remembers them for a few hours, and any turn asked something location-
+// dependent (weather, nearby places, travel time) within that window gets
+// a short context line about where the user is. Not a weather feature by
+// itself -- a "does the model know where the user is" primitive.
+//
+// --- What plugins can actually see here: verified against the compiled
+//     bundle, not assumed from docs (same discipline as everything else
+//     touched in this repo today) ---
+//
+// message_received's shipped event type (PluginHookMessageReceivedEvent,
+// dist/hook-types-*.d.ts) has no lat/lon/location field, and tracing the
+// exact function that builds that event (toPluginMessageReceivedEvent,
+// dist/message-hook-mappers-*.js) confirms its `metadata` object is a fixed,
+// enumerated list of fields that doesn't include one either. Telegram's own
+// channel plugin DOES parse message.location/message.venue into a
+// structured object (extractTelegramLocation, dist/sent-message-cache-*.js)
+// -- but that structured data only ever feeds the model-facing PROMPT
+// context (docs/channels/location.md's LocationLat/LocationLon/... fields),
+// never the plugin hook payload. The only trace of a location share a
+// plugin can see at all is the flattened text OpenClaw's Telegram channel
+// renders into `content` (formatLocationText, dist/channel-inbound-*.js):
+//   "📍 <lat>, <lon>" (+" ±<n>m" if accuracy is known) for a pin/venue share
+//   "🛰 Live location: <lat>, <lon>" (+accuracy) for a live share
+// So this plugin regex-parses that text. This is a real, structural
+// limitation of this OpenClaw version, not a design choice -- there is no
+// structured location surface for plugin hooks to read.
+//
+// Telegram's Live Location repeat ticks (position updates while a live
+// share is active) arrive as `edited_message` Telegram updates, not
+// `message` updates. Confirmed by reading the compiled Telegram ingress
+// (dist/telegram-ingress-spool-*.js): `bot.on("edited_message", ...)`
+// routes only through recordEditedMessageForReplyChain (a reply-chain
+// cache), which never calls into the inbound-hook pipeline that produces
+// message_received -- unlike `bot.on("message", ...)`, which does. So
+// message_received never fires again for a live-location refresh tick:
+// every location match this plugin ever sees is a first share, never a
+// repeat. That's convenient (no is_edit disambiguation needed, unlike
+// Nelita's Python bridge, which polls raw Telegram updates directly and has
+// to filter edited_message ticks itself) but it's also a real, honest gap:
+// unlike Nelita, an active Live Location share's position here goes stale
+// after LOCATION_FRESH_MS like an ordinary one-shot pin -- it does NOT keep
+// refreshing silently in the background, because OpenClaw's plugin surface
+// has nothing to refresh it from.
+//
+// message_received is observation-only (handler returns void -- confirmed
+// from its exact type, dist/hook-types-*.d.ts) -- it cannot stop the normal
+// agent turn from also seeing and replying to the same "📍 <lat>, <lon>"
+// text. Same real, visible degradation plugins/website/index.ts already
+// flags for its own claimed-follow-up path: sharing a location may produce
+// TWO replies (this plugin's short ack, and whatever the model naturally
+// says back to a raw coordinate string) until/unless OpenClaw adds a way to
+// claim an inbound message outright.
+//
+// Storage: in-memory Map, matching this repo's current, deliberate
+// convention (as of commit 300ff41 -- see quick-menu/thinking-bubble's own
+// history in their headers) of NOT persisting plugin state under
+// /data/plugin-state/... anymore; that durable-file approach was tried
+// earlier today for an unrelated problem (the keyboard-carrier message) and
+// abandoned in favor of a simpler design. A 6h freshness window is short
+// enough that losing it on a container restart/redeploy is a minor,
+// acceptable degradation -- consistent with plugins/website/index.ts's own
+// sitesBySessionKey/awaitingDescriptionBySessionKey being in-memory-only
+// despite representing "real" state too.
+//
+// Context injection: before_prompt_build (dist/hook-runner-global-*.js's
+// runBeforePromptBuild -- genuinely dispatched, not just documented,
+// confirmed by reading the hook runner itself, not just hooks.md) is the
+// hook PROMPT_INJECTION_HOOK_NAMES lists for exactly this. Its ctx argument
+// (PluginHookAgentContext) carries `sessionKey`, the same correlation key
+// message_received's event carries, used here to look up the right chat's
+// stored location. Whether this hook actually fires and actually reaches
+// the model was verified live against the test box -- see the repo's
+// verification notes for what was actually observed, not assumed.
+
+import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+
+const LOCATION_FRESH_MS = 6 * 60 * 60 * 1000; // 6h, matching Nelita's LOCATION_FRESH_SECS default
+
+/** Matches formatLocationText's exact output (dist/channel-inbound-*.js) --
+ * the only location data visible to a plugin hook in this OpenClaw version.
+ * See header comment. */
+// The bare 📍 alternative can, in principle, match a user manually typing/
+// pasting two decimal numbers next to a pin emoji -- there's no structured
+// signal to disambiguate that from a real share (see header comment for
+// why). Accepted false-positive risk given the platform's real constraints;
+// worst case is a stale/wrong location context for one turn.
+const LOCATION_TEXT_RE = /(🛰 Live location:|📍)\s*(-?\d+\.\d+),\s*(-?\d+\.\d+)/;
+
+type StoredLocation = { lat: number; lon: number; ts: number; isLive: boolean };
+
+/** sessionKey -> last known location. In-memory only -- see header comment. */
+const locationBySessionKey = new Map<string, StoredLocation>();
+
+function parseLocationText(content: string): { lat: number; lon: number; isLive: boolean } | undefined {
+  const m = content.match(LOCATION_TEXT_RE);
+  if (!m) return undefined;
+  const lat = Number(m[2]);
+  const lon = Number(m[3]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return undefined;
+  return { lat, lon, isLive: m[1].startsWith("🛰") };
+}
+
+async function tg(botToken: string, method: string, body: Record<string, unknown>) {
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const json = (await res.json().catch(() => ({}))) as { ok?: boolean; description?: string };
+  if (!json.ok) {
+    throw new Error(`Telegram ${method} failed: ${json.description ?? res.status}`);
+  }
+  return json;
+}
+
+/** Same defensive fan-out pattern as plugins/quick-menu/index.ts and
+ * plugins/website/index.ts's own extractChatId -- the real runtime event
+ * carries more candidate fields than its shipped .d.ts type does. */
+function extractChatId(event: Record<string, unknown>, ctx: Record<string, unknown>): string | undefined {
+  const metadata = (event as { metadata?: Record<string, unknown> }).metadata ?? {};
+  const candidates = [
+    (metadata as { senderId?: string | number }).senderId,
+    (event as { chatId?: string | number }).chatId,
+    (event as { senderId?: string | number }).senderId,
+    (ctx as { chatId?: string | number }).chatId,
+    (ctx as { senderId?: string | number }).senderId,
+    (ctx as { channelContext?: { chat?: { id?: string | number } } }).channelContext?.chat?.id,
+  ];
+  for (const c of candidates) {
+    if (c !== undefined && c !== null && String(c).length > 0) return String(c);
+  }
+  return undefined;
+}
+
+function extractProvider(event: Record<string, unknown>, ctx: Record<string, unknown>): string | undefined {
+  const metadata = (event as { metadata?: Record<string, unknown> }).metadata ?? {};
+  return (
+    (metadata as { provider?: string }).provider ??
+    (event as { channel?: string }).channel ??
+    (ctx as { messageProvider?: string }).messageProvider ??
+    (ctx as { channel?: string }).channel
+  );
+}
+
+/** Fresh copy for this product -- not Nelita's wording. Doesn't promise a
+ * live-tracking duration (unlike Nelita) since this plugin never sees
+ * Live Location's repeat ticks -- see header comment. */
+const LOCATION_ACK_TEXT =
+  "📍 Got your location. I'll use it for anything nearby -- weather, places, travel time -- for the next few hours.";
+
+export default definePluginEntry({
+  id: "location",
+  name: "Location",
+  description:
+    "Lets the user share their Telegram location via the quick-menu button and injects it as short-lived context into subsequent turns, matching Nelita's location-sharing behavior.",
+  register(api) {
+    // Lazy eviction inside before_prompt_build only evicts a session's entry
+    // when that session actually gets another turn -- a chat that shares a
+    // location once and never turns again would otherwise leak forever.
+    // Same sweep pattern as plugins/website/index.ts's
+    // awaitingDescriptionBySessionKey for the identical reason. unref() so
+    // it can't keep the process alive on its own.
+    setInterval(() => {
+      const now = Date.now();
+      for (const [sessionKey, loc] of locationBySessionKey) {
+        if (now - loc.ts > LOCATION_FRESH_MS) locationBySessionKey.delete(sessionKey);
+      }
+    }, 60_000).unref();
+
+    api.on(
+      "message_received",
+      async (event, ctx) => {
+        const e = (event ?? {}) as Record<string, unknown>;
+        const c = (ctx ?? {}) as Record<string, unknown>;
+
+        const provider = extractProvider(e, c);
+        if (provider !== "telegram") return;
+
+        const content = typeof e.content === "string" ? e.content : "";
+        const loc = parseLocationText(content);
+        if (!loc) return;
+
+        const sessionKey = (typeof e.sessionKey === "string" && e.sessionKey) || (c as { sessionKey?: string }).sessionKey || "global";
+        locationBySessionKey.set(sessionKey, { lat: loc.lat, lon: loc.lon, ts: Date.now(), isLive: loc.isLive });
+
+        const botToken = process.env.LOCATION_BOT_TOKEN;
+        const chatId = extractChatId(e, c);
+        if (!botToken || !chatId) return;
+
+        try {
+          await tg(botToken, "sendMessage", { chat_id: chatId, text: LOCATION_ACK_TEXT });
+        } catch (err) {
+          console.error("[location] failed to send location ack:", err instanceof Error ? err.message : String(err));
+        }
+      },
+      { priority: 10 },
+    );
+
+    api.on("before_prompt_build", async (_event, ctx) => {
+      const sessionKey = (ctx as { sessionKey?: string } | undefined)?.sessionKey ?? "global";
+      const loc = locationBySessionKey.get(sessionKey);
+      if (!loc) return;
+
+      const age = Date.now() - loc.ts;
+      if (age > LOCATION_FRESH_MS) {
+        locationBySessionKey.delete(sessionKey);
+        return;
+      }
+
+      const minutes = Math.max(0, Math.round(age / 60000));
+      const when = minutes < 1 ? "just now" : `${minutes} min ago`;
+      return {
+        prependContext:
+          `[location: the user's last shared position is latitude ${loc.lat.toFixed(4)}, longitude ` +
+          `${loc.lon.toFixed(4)} (shared ${when}). Use it only if the request is location-dependent ` +
+          `(weather, nearby places, travel time); ignore it otherwise. Never read raw coordinates back to ` +
+          `the user -- name the place if you can determine one, otherwise just use it silently.]\n\n`,
+      };
+    });
+  },
+});
+LOCATIONPLUGINTS
+docker exec openclaw mkdir -p /data/workspace/.openclaw/extensions/location
+docker cp "$PLUGIN_DIR/openclaw.plugin.json" openclaw:/data/workspace/.openclaw/extensions/location/openclaw.plugin.json
+docker cp "$PLUGIN_DIR/index.ts" openclaw:/data/workspace/.openclaw/extensions/location/index.ts
 rm -rf "$PLUGIN_DIR"
 
 # ---------------------------------------------------------------------------
@@ -2007,6 +2392,11 @@ cfg.plugins.load.paths = Array.from(new Set([...(cfg.plugins.load.paths || []), 
 cfg.plugins.entries['quick-menu'] = { enabled: true };
 cfg.plugins.allow = Array.from(new Set([...(cfg.plugins.allow || []), 'quick-menu']));
 cfg.plugins.load.paths = Array.from(new Set([...(cfg.plugins.load.paths || []), '/data/workspace/.openclaw/extensions/quick-menu']));
+// Location plugin (installed above as a workspace extension), same
+// allow/load-paths trust dance as the others above.
+cfg.plugins.entries['location'] = { enabled: true };
+cfg.plugins.allow = Array.from(new Set([...(cfg.plugins.allow || []), 'location']));
+cfg.plugins.load.paths = Array.from(new Set([...(cfg.plugins.load.paths || []), '/data/workspace/.openclaw/extensions/location']));
 // A prompt-driven send-then-delete 'thinking' placeholder was tried twice
 // (08-17) and dropped for real this time: on a genuinely clean session
 // (confirmed the earlier failures were session pollution from unrelated

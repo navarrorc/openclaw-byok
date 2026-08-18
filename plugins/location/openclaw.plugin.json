@@ -1,0 +1,14 @@
+{
+  "id": "location",
+  "name": "Location",
+  "description": "Lets the user share their Telegram location via the quick-menu button and injects it as short-lived context into subsequent turns, matching Nelita's location-sharing behavior.",
+  "version": "1.0.0",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
