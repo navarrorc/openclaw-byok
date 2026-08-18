@@ -121,19 +121,52 @@
 // exact same shared registry -- there is nothing website-specific
 // protecting it, just luck of timing so far.
 //
-// Fix: stop depending on that registry entirely for this command. Detect
-// the literal "/clearchat" text via `message_received` instead -- the same
-// hook /start and /new already use below, proven reliable all day -- and
-// run the clear-chat logic directly, bypassing native command dispatch (and
-// its "Command not found." fallback) completely. No more `api.registerCommand`
-// call for clearchat, so grammy never wires up a route for it that could
-// point at an emptied registry. Same tradeoff /website's own header already
-// accepts for its bare-command follow-up flow: message_received can't stop
-// the normal agent turn from also seeing "/clearchat" as plain text, so a
-// stray conversational reply after the clear-confirmation is possible. That
-// didn't matter for /new (a real native built-in command that properly
-// suppresses the agent turn) but does apply here, since /clearchat has no
-// native counterpart to piggyback on. Flagged, not hidden -- see report.
+// Fix (round 1): stop depending on that registry entirely for this command.
+// Detect the literal "/clearchat" text via `message_received` instead -- the
+// same hook /start and /new already use below -- and run the clear-chat
+// logic directly, bypassing native command dispatch (and its "Command not
+// found." fallback) completely. No more `api.registerCommand` call for
+// clearchat, so grammy never wires up a route for it that could point at an
+// emptied registry.
+//
+// --- Fix (round 2), live confirmed with a screenshot, 08-18 ---
+//
+// Round 1's own documented tradeoff bit for real: `message_received` is a
+// pure OBSERVER hook -- it can run its own side effects (the confirmation
+// send + bulk delete below) but has no way to stop OpenClaw's normal
+// agent-turn dispatch from ALSO seeing the raw "/clearchat" text and having
+// the model reply to it conversationally. Rob confirmed live, twice, that
+// this produces a stray (sometimes duplicate) LLM reply after the clear
+// confirmation -- unacceptable, since the product owner's bar is "behaves
+// exactly like wizbid/reseller's own /clearchat", where slash commands never
+// reach the LLM at all.
+//
+// The actual fix: `reply_dispatch`, not `message_received`. Confirmed by
+// reading this exact deployed OpenClaw version's own source
+// (2026.7.1-2, /opt/openclaw/app/src/auto-reply/reply/dispatch-from-config.ts
+// ~2973-3020): the gateway runs `hookRunner.runReplyDispatch(...)` and, if
+// any handler returns `{ handled: true, ... }`, returns immediately --
+// BEFORE the code path a few lines below that acquires the dispatch
+// operation and hands the turn to the agent ever runs. That's a structural
+// short-circuit upstream of the LLM call, not a race against it. Also
+// confirmed present in this version's `hook-types.ts` (PluginHookReplyDispatchEvent/
+// Context/Result, matching field-for-field) and exercised by this version's
+// own `wired-hooks-reply-dispatch.test.ts` ("stops at the first handler that
+// claims reply dispatch"). This is exactly the mechanism wizbid's and
+// reseller's own working `/clearchat` commands use in this same operator's
+// ai-farm environment (ai-farm/plugins/wizbid-tools/index.cjs
+// `fastPath.kind === 'clearchat'`, ai-farm/plugins/reseller-tools/index.cjs),
+// and the exact call sequence below (onReplyStart -> run the command ->
+// dispatcher.markComplete() -> recordProcessed('completed') ->
+// markIdle(reason)) matches that proven pattern, documented in
+// `~/.claude/projects/-home-lenov-projects-ai-farm/memory/
+// feedback_openclaw_plugin_for_fast_dispatch.md`.
+//
+// /start and /new deliberately stay on `message_received` below -- /new is a
+// real native command that already suppresses the agent turn on its own,
+// and /start intentionally piggybacks the LLM's own personalized welcome
+// (see this file's top section). Only /clearchat had no native counterpart
+// to rely on, so it's the only command moved to `reply_dispatch`.
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
@@ -229,6 +262,42 @@ function extractProvider(event: Record<string, unknown>, ctx: Record<string, unk
   );
 }
 
+/** `reply_dispatch`'s event carries a `FinalizedMsgContext` (confirmed against
+ * this deployed OpenClaw version's own `src/auto-reply/templating.ts`), a
+ * completely different shape from `message_received`'s event/ctx pair above
+ * -- these two resolvers are NOT interchangeable with extractChatId/
+ * extractProvider. Body-field priority (BodyForCommands > CommandBody >
+ * RawBody > Body) matches the exact chain wizbid-tools/index.cjs uses for
+ * command detection off this same hook. */
+function resolveReplyDispatchBody(finalizedCtx: Record<string, unknown>): string {
+  const body =
+    (finalizedCtx as { BodyForCommands?: string }).BodyForCommands ??
+    (finalizedCtx as { CommandBody?: string }).CommandBody ??
+    (finalizedCtx as { RawBody?: string }).RawBody ??
+    (finalizedCtx as { Body?: string }).Body ??
+    "";
+  return body.trim();
+}
+
+/** Chat-id chain: `ChatId` first (the field templating.ts documents as the
+ * "provider-native chat/conversation id"), then the same SenderId/From/To
+ * fallback chain ai-farm/plugins/shared/telegram-helpers.cjs's own
+ * `resolveChatId` uses against this same hook in wizbid/reseller's proven,
+ * live-working `/clearchat` -- for a Telegram DM (this product's only
+ * supported chat type) the sender id and chat id are the same value. */
+function resolveReplyDispatchChatId(finalizedCtx: Record<string, unknown>): string | undefined {
+  const candidates = [
+    (finalizedCtx as { ChatId?: string }).ChatId,
+    (finalizedCtx as { SenderId?: string }).SenderId,
+    (finalizedCtx as { From?: string }).From,
+    (finalizedCtx as { To?: string }).To,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim().length > 0) return c.trim();
+  }
+  return undefined;
+}
+
 // --- /clearchat ---
 //
 // Matches FarmOps' clear_chat exactly (ai-farm/scripts/bridge_common.py:
@@ -260,10 +329,10 @@ function extractProvider(event: Record<string, unknown>, ctx: Record<string, unk
 // conversation/session state, which is what /new (already a separate real
 // OpenClaw command) is for.
 //
-// Triggered from message_received (see header's "real root cause" section
-// for why this isn't api.registerCommand), so this is a plain function
-// called directly from that hook, not a PluginCommandContext handler --
-// takes botToken/chatId straight, no ctx to unpack.
+// Triggered from reply_dispatch (see header's "Fix (round 2)" section for
+// why this isn't message_received or api.registerCommand), so this is a
+// plain function called directly from that hook, not a PluginCommandContext
+// handler -- takes botToken/chatId straight, no ctx to unpack.
 const CLEARCHAT_DEPTH = 300;
 const CLEARCHAT_TEXT = "✅ chat cleared. /clearchat to clear again.";
 
@@ -330,14 +399,8 @@ export default definePluginEntry({
           ? (event as { content: string }).content.trim()
           : "";
 
-        if (isClearChatCommand(content)) {
-          try {
-            await performClearChat(botToken, chatId);
-          } catch (err) {
-            console.error("[quick-menu] clearchat: unexpected failure:", err instanceof Error ? err.message : String(err));
-          }
-          return;
-        }
+        // /clearchat is handled from the reply_dispatch registration below,
+        // not here -- see this file's "Fix (round 2)" header section for why.
 
         let text: string | undefined;
         if (isStartCommand(content)) text = START_KEYBOARD_TEXT;
@@ -357,13 +420,62 @@ export default definePluginEntry({
       { priority: 10 },
     );
 
-    // Permanent, low-noise proof this plugin's message_received-driven
-    // commands (start/new/clearchat keyboard triggers) are actually wired up
+    // /clearchat: reply_dispatch, not message_received -- see this file's
+    // "Fix (round 2)" header section. This hook fires BEFORE OpenClaw builds
+    // the agent turn (confirmed against this deployed version's own
+    // dispatch-from-config.ts), so returning `{ handled: true, ... }` here
+    // structurally prevents any LLM call for this message, not just races
+    // one. Call sequence (onReplyStart -> run the command ->
+    // dispatcher.markComplete() -> recordProcessed('completed') ->
+    // markIdle(reason)) matches wizbid/reseller's own proven /clearchat
+    // exactly, per feedback_openclaw_plugin_for_fast_dispatch.md.
+    api.on(
+      "reply_dispatch",
+      async (event, ctx) => {
+        const botToken = process.env.QUICK_MENU_BOT_TOKEN;
+        if (!botToken) return;
+
+        const finalizedCtx = (event.ctx ?? {}) as Record<string, unknown>;
+        const provider = (finalizedCtx as { Provider?: string }).Provider;
+        if (provider !== "telegram") return;
+
+        const content = resolveReplyDispatchBody(finalizedCtx);
+        if (!isClearChatCommand(content)) return;
+
+        const chatId = resolveReplyDispatchChatId(finalizedCtx);
+        if (!chatId) return;
+
+        if (ctx.onReplyStart) await ctx.onReplyStart();
+
+        try {
+          await performClearChat(botToken, chatId);
+        } catch (err) {
+          console.error("[quick-menu] clearchat: unexpected failure:", err instanceof Error ? err.message : String(err));
+        }
+
+        // Delivered directly via the Telegram API above (not through
+        // dispatcher.sendFinalReply), so queuedFinal is false and the lane
+        // is released explicitly via markIdle -- same shape reseller-tools
+        // uses for its own tgFetch-delivered commands, and the same fix
+        // (commit 8146b2e, per the memory file) for the "lane stuck in
+        // `processing` for 11-30s after a handled command" bug that
+        // omitting markIdle causes.
+        ctx.dispatcher.markComplete();
+        ctx.recordProcessed("completed");
+        ctx.markIdle("quick_menu_clearchat_handled");
+        return { handled: true, queuedFinal: false, counts: ctx.dispatcher.getQueuedCounts() };
+      },
+      { priority: 10 },
+    );
+
+    // Permanent, low-noise proof this plugin's hooks are actually wired up
     // at startup -- cheap insurance after a debugging session that spent
     // hours unable to trust api.registerCommand's silent-void registration
     // path for exactly this kind of confirmation. If this line is missing
     // from `docker logs openclaw` after a boot, quick-menu's register()
     // itself didn't run to completion.
-    console.log("[quick-menu] message_received triggers registered: /start, /new, /clearchat (keyboard sender)");
+    console.log(
+      "[quick-menu] message_received triggers registered: /start, /new (keyboard sender); reply_dispatch registered: /clearchat",
+    );
   },
 });
