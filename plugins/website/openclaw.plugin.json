@@ -15,6 +15,7 @@
   "activation": {
     "onStartup": true
   },
+  "skills": ["./skills"],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

@@ -381,6 +381,24 @@ as plain text, not as a button — Telegram will auto-link it. Calling
 just call it again with updated HTML rather than asking to "close" first.
 Call `close_website` when the user says they're done with it or asks to
 close it.
+
+Make it look like a real product, not a bare unstyled page — consult the
+`website-design` skill for the full design system (theme choice, DaisyUI
+components, visual-quality checklist). At minimum, every page you publish
+must include the Tailwind + DaisyUI CDN tags and this layout-safety CSS in
+`<head>`:
+
+```html
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  :where(.grid, .flex) > * { min-width: 0; }
+  :where(p, h1, h2, h3, h4, li, td, th) { overflow-wrap: anywhere; }
+  :where(img, svg, video, canvas, iframe) { max-width: 100%; height: auto; }
+</style>
+```
 <!-- openclaw-byok-addendum:end -->
 AGENTSMD
 docker cp /tmp/openclaw-AGENTS-addendum.md openclaw:/tmp/agents-addendum.md
@@ -868,6 +886,7 @@ cat > "$PLUGIN_DIR/openclaw.plugin.json" <<'WEBSITEPLUGINJSON'
   "activation": {
     "onStartup": true
   },
+  "skills": ["./skills"],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -1060,6 +1079,8 @@ cat > "$PLUGIN_DIR/index.ts" <<'WEBSITEPLUGINTS'
 import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
@@ -1071,6 +1092,37 @@ const TUNNEL_STARTUP_TIMEOUT_MS = 20_000;
  * NOT /usr/local/bin (container writable layer, wiped on every
  * --force-recreate). See header comment for the incident this fixes. */
 const CLOUDFLARED_PATH = "/data/bin/cloudflared";
+
+/** The `website-design` skill, shipped alongside this plugin (declared via
+ * `"skills": ["./skills"]` in openclaw.plugin.json) so OpenClaw's normal
+ * skill-discovery makes it available to the *main agent turn* -- the path
+ * `publish_website` itself is reached through (the agent generates HTML
+ * itself, per AGENTS.md's addendum, then calls the tool with it; the tool
+ * handler here never talks to the LLM at all).
+ *
+ * Confirmed against this deployed version's own docs/tools/skills.md:
+ * skill *bodies* are not unconditionally injected into every turn's system
+ * prompt -- only a compact name/description/location entry is, per skill,
+ * every turn ("Token impact" section: ~97 chars + field lengths, not full
+ * body size). Full instructions load "after trigger" (progressive
+ * disclosure, the same AgentSkills spec OpenClaw says it follows). That's a
+ * real, live mechanism for the agent-turn path, but not a hard guarantee
+ * this exact skill gets read before every single generation.
+ *
+ * The two paths that bypass the agent turn entirely -- generateHtml() below,
+ * used by the /website fast path and the reply_dispatch claimed-follow-up
+ * handler -- call a low-level `llm.complete()` primitive directly and get
+ * NO system-prompt-building, hence no skill injection of any kind (compact
+ * or full). For those, this same file is read directly at request time
+ * (loadDesignGuidance below) and its body interpolated straight into the
+ * completion's systemPrompt -- a real, code-level "by construction"
+ * guarantee that doesn't depend on the model choosing to consult a skill. */
+const SKILL_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "skills",
+  "website-design",
+  "SKILL.md",
+);
 
 /** How long a bare `/website`'s "awaiting description" state stays claimable.
  * Distinct concern from sitesBySessionKey's own no-timeout policy (that one
@@ -1372,10 +1424,43 @@ function stripCodeFence(text) {
   return match ? match[1] : trimmed;
 }
 
-const WEBSITE_COMMAND_SYSTEM_PROMPT =
+const WEBSITE_COMMAND_SYSTEM_PROMPT_BASE =
   "You build a single self-contained HTML page on request. Output ONLY the raw HTML document " +
   "(starting with <!DOCTYPE html> or <html>) -- no markdown code fences, no commentary before or " +
   "after. Inline all CSS and JS; do not reference external files or a build step.";
+
+/** Cached after first read -- this only changes on a redeploy, and
+ * generateHtml() may run often within one gateway process lifetime. `null`
+ * means "already tried, file unavailable" so a missing/broken skill file
+ * degrades to the bare base prompt instead of retrying a failing read (and
+ * logging a warning) on every single generation. */
+let cachedDesignGuidance;
+
+/** Reads the `website-design` skill's own body (see SKILL_PATH comment
+ * above) and strips its YAML frontmatter, so the exact same design-system
+ * text that ships as a real OpenClaw skill also gets folded directly into
+ * the system prompt for the two generation paths that bypass skill
+ * injection entirely. One file, no second copy to drift out of sync. */
+function loadDesignGuidance() {
+  if (cachedDesignGuidance !== undefined) return cachedDesignGuidance;
+  try {
+    const raw = fs.readFileSync(SKILL_PATH, "utf8");
+    const body = raw.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
+    cachedDesignGuidance = body;
+  } catch (err) {
+    console.error(
+      `[website] couldn't read design skill at ${SKILL_PATH}, generating with the bare prompt instead:`,
+      err instanceof Error ? err.message : String(err),
+    );
+    cachedDesignGuidance = "";
+  }
+  return cachedDesignGuidance;
+}
+
+function buildWebsiteCommandSystemPrompt() {
+  const guidance = loadDesignGuidance();
+  return guidance ? `${WEBSITE_COMMAND_SYSTEM_PROMPT_BASE}\n\n${guidance}` : WEBSITE_COMMAND_SYSTEM_PROMPT_BASE;
+}
 
 /** Plain text, not markdown -- this goes through the normal command-reply
  * pipeline, which nothing else in this file assumes renders markdown. */
@@ -1394,7 +1479,7 @@ const WEBSITE_INTRO =
 async function generateHtml(llm, description) {
   const completion = await llm.complete({
     messages: [{ role: "user", content: description }],
-    systemPrompt: WEBSITE_COMMAND_SYSTEM_PROMPT,
+    systemPrompt: buildWebsiteCommandSystemPrompt(),
     purpose: "website.command.generate",
     maxTokens: 8192,
     temperature: 0.4,
@@ -1719,9 +1804,115 @@ export default definePluginEntry({
   },
 });
 WEBSITEPLUGINTS
+mkdir -p "$PLUGIN_DIR/skills/website-design"
+cat > "$PLUGIN_DIR/skills/website-design/SKILL.md" <<'WEBSITEDESIGNSKILLMD'
+---
+name: website-design
+description: Use whenever generating a self-contained HTML page to publish via publish_website or /website — makes it look like a real, professional product instead of plain unstyled HTML.
+metadata: { "openclaw": { "always": true } }
+---
+
+# Website design
+
+`publish_website` and `/website` ship whatever HTML you hand them, byte for
+byte. There is no template, no CSS pipeline, no reviewer in between — a plain
+`<h1>` and unstyled `<div>`s go out exactly as plain and unstyled as they were
+written. Treat every page as a real product surface, not a scratch note.
+
+## Decide the look, in this order
+
+1. **The user specified a look, brand, or reference.** Follow it. Their
+   explicit ask always outranks anything below.
+2. **Otherwise, use the system in this file.** Never fall back to bare
+   unstyled HTML — a page with no design system is the failure mode this
+   skill exists to prevent.
+
+## The stack: Tailwind v4 + DaisyUI v5, zero build step
+
+This is a single self-contained HTML file with no bundler, so pull both in
+as CDN `<link>`/`<script>` tags in `<head>`. Paste this exactly:
+
+```html
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
+```
+
+Tailwind's browser build compiles utility classes live in the page, and
+DaisyUI layers real component classes (`btn`, `card`, `navbar`, ...) on top —
+together they turn raw markup into something that looks designed, with no
+separate build step this plugin doesn't have anyway.
+
+## Pick a theme, then use semantic classes
+
+Set `<html data-theme="...">`. Default to **`luxury`** unless the request
+points somewhere else. A few other good fits by vibe:
+
+- `corporate` — clean SaaS/dashboard, safe default for internal tools
+- `business` — dark, dense, data-heavy admin panels
+- `forest` / `night` — dark developer-tool aesthetic
+- `cupcake` / `pastel` — friendly, consumer-facing, lighter tone
+- `winter` — crisp light theme when `luxury` reads too heavy
+
+Then reach for DaisyUI's **semantic** color classes (`bg-base-100`,
+`bg-base-200`, `text-base-content`, `btn-primary`, `badge-secondary`,
+`alert-success`, ...) instead of hardcoded Tailwind colors (`bg-slate-800`,
+`text-gray-300`). Semantic classes repaint correctly if the theme changes;
+hardcoded colors don't and usually clash with whichever theme you picked.
+
+## Layout-safety CSS — paste this every time
+
+The single most common way a generated page "looks broken" is horizontal
+overflow on a phone: a nested flex/grid child refusing to shrink below its
+content width. Put this in `<head>` on every page, no exceptions:
+
+```html
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  :where(.grid, .flex) > * { min-width: 0; }
+  :where(p, h1, h2, h3, h4, li, td, th) { overflow-wrap: anywhere; }
+  :where(img, svg, video, canvas, iframe) { max-width: 100%; height: auto; }
+</style>
+```
+
+## Reach for real components, not bare tags
+
+A plain `<button>` and `<div>` is exactly the "plain and not professional"
+failure this skill exists to fix. Use DaisyUI's actual components instead —
+these are the ones that carry the most visual weight per line of markup:
+
+- **Buttons** — `btn btn-primary` / `btn-outline` / `btn-ghost`, sized with
+  `btn-sm`/`btn-lg`
+- **Cards** — `card bg-base-100 shadow-xl` with `card-body`, `card-title`,
+  `card-actions` for any grouped content block, not just literal products
+- **Stats** — `stats` + `stat`/`stat-title`/`stat-value`/`stat-desc` for any
+  dashboard number instead of a bare styled `<div>`
+- **Tables** — `table` (+ `table-zebra` for readability) for any tabular data
+- **Forms** — `input input-bordered`, `select select-bordered`,
+  `label`/`fieldset`, `textarea textarea-bordered`
+- **Navbar** — `navbar bg-base-100` as the page header on anything with more
+  than one section
+- **Hero** — `hero` + `hero-content` for a landing page's top section
+- **Alerts** — `alert alert-info`/`alert-success`/... for status/feedback
+  messages instead of plain colored text
+
+## Visual quality checklist
+
+- **Hierarchy** — one clear "most important thing" per screen, made obvious
+  by size/weight/color, not five equally-loud headings.
+- **Whitespace** — generous padding/gaps (`p-6`, `gap-4`, `space-y-6`
+  territory). Content crammed edge-to-edge reads as unfinished, not dense.
+- **One color story** — pick the theme, then 1–2 accent colors used via
+  `-primary`/`-secondary`/`-accent` classes. Don't hand-mix extra hues on top.
+- **Mobile-first, always** — this is a link opened from Telegram, primarily
+  on a phone. Design and mentally check the layout at **~390px wide** as the
+  primary target, not desktop. Stack columns (`flex-col md:flex-row`,
+  `grid-cols-1 md:grid-cols-3`) rather than assuming room for a wide layout.
+WEBSITEDESIGNSKILLMD
 docker exec openclaw mkdir -p /data/workspace/.openclaw/extensions/website
 docker cp "$PLUGIN_DIR/openclaw.plugin.json" openclaw:/data/workspace/.openclaw/extensions/website/openclaw.plugin.json
 docker cp "$PLUGIN_DIR/index.ts" openclaw:/data/workspace/.openclaw/extensions/website/index.ts
+docker cp "$PLUGIN_DIR/skills" openclaw:/data/workspace/.openclaw/extensions/website/skills
 rm -rf "$PLUGIN_DIR"
 
 # ---------------------------------------------------------------------------

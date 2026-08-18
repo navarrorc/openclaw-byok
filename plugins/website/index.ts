@@ -182,6 +182,8 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
@@ -193,6 +195,37 @@ const TUNNEL_STARTUP_TIMEOUT_MS = 20_000;
  * NOT /usr/local/bin (container writable layer, wiped on every
  * --force-recreate). See header comment for the incident this fixes. */
 const CLOUDFLARED_PATH = "/data/bin/cloudflared";
+
+/** The `website-design` skill, shipped alongside this plugin (declared via
+ * `"skills": ["./skills"]` in openclaw.plugin.json) so OpenClaw's normal
+ * skill-discovery makes it available to the *main agent turn* -- the path
+ * `publish_website` itself is reached through (the agent generates HTML
+ * itself, per AGENTS.md's addendum, then calls the tool with it; the tool
+ * handler here never talks to the LLM at all).
+ *
+ * Confirmed against this deployed version's own docs/tools/skills.md:
+ * skill *bodies* are not unconditionally injected into every turn's system
+ * prompt -- only a compact name/description/location entry is, per skill,
+ * every turn ("Token impact" section: ~97 chars + field lengths, not full
+ * body size). Full instructions load "after trigger" (progressive
+ * disclosure, the same AgentSkills spec OpenClaw says it follows). That's a
+ * real, live mechanism for the agent-turn path, but not a hard guarantee
+ * this exact skill gets read before every single generation.
+ *
+ * The two paths that bypass the agent turn entirely -- generateHtml() below,
+ * used by the /website fast path and the reply_dispatch claimed-follow-up
+ * handler -- call a low-level `llm.complete()` primitive directly and get
+ * NO system-prompt-building, hence no skill injection of any kind (compact
+ * or full). For those, this same file is read directly at request time
+ * (loadDesignGuidance below) and its body interpolated straight into the
+ * completion's systemPrompt -- a real, code-level "by construction"
+ * guarantee that doesn't depend on the model choosing to consult a skill. */
+const SKILL_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "skills",
+  "website-design",
+  "SKILL.md",
+);
 
 /** How long a bare `/website`'s "awaiting description" state stays claimable.
  * Distinct concern from sitesBySessionKey's own no-timeout policy (that one
@@ -494,10 +527,43 @@ function stripCodeFence(text) {
   return match ? match[1] : trimmed;
 }
 
-const WEBSITE_COMMAND_SYSTEM_PROMPT =
+const WEBSITE_COMMAND_SYSTEM_PROMPT_BASE =
   "You build a single self-contained HTML page on request. Output ONLY the raw HTML document " +
   "(starting with <!DOCTYPE html> or <html>) -- no markdown code fences, no commentary before or " +
   "after. Inline all CSS and JS; do not reference external files or a build step.";
+
+/** Cached after first read -- this only changes on a redeploy, and
+ * generateHtml() may run often within one gateway process lifetime. `null`
+ * means "already tried, file unavailable" so a missing/broken skill file
+ * degrades to the bare base prompt instead of retrying a failing read (and
+ * logging a warning) on every single generation. */
+let cachedDesignGuidance;
+
+/** Reads the `website-design` skill's own body (see SKILL_PATH comment
+ * above) and strips its YAML frontmatter, so the exact same design-system
+ * text that ships as a real OpenClaw skill also gets folded directly into
+ * the system prompt for the two generation paths that bypass skill
+ * injection entirely. One file, no second copy to drift out of sync. */
+function loadDesignGuidance() {
+  if (cachedDesignGuidance !== undefined) return cachedDesignGuidance;
+  try {
+    const raw = fs.readFileSync(SKILL_PATH, "utf8");
+    const body = raw.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
+    cachedDesignGuidance = body;
+  } catch (err) {
+    console.error(
+      `[website] couldn't read design skill at ${SKILL_PATH}, generating with the bare prompt instead:`,
+      err instanceof Error ? err.message : String(err),
+    );
+    cachedDesignGuidance = "";
+  }
+  return cachedDesignGuidance;
+}
+
+function buildWebsiteCommandSystemPrompt() {
+  const guidance = loadDesignGuidance();
+  return guidance ? `${WEBSITE_COMMAND_SYSTEM_PROMPT_BASE}\n\n${guidance}` : WEBSITE_COMMAND_SYSTEM_PROMPT_BASE;
+}
 
 /** Plain text, not markdown -- this goes through the normal command-reply
  * pipeline, which nothing else in this file assumes renders markdown. */
@@ -516,7 +582,7 @@ const WEBSITE_INTRO =
 async function generateHtml(llm, description) {
   const completion = await llm.complete({
     messages: [{ role: "user", content: description }],
-    systemPrompt: WEBSITE_COMMAND_SYSTEM_PROMPT,
+    systemPrompt: buildWebsiteCommandSystemPrompt(),
     purpose: "website.command.generate",
     maxTokens: 8192,
     temperature: 0.4,
