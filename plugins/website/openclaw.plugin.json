@@ -6,6 +6,12 @@
   "contracts": {
     "tools": ["publish_website", "close_website"]
   },
+  "commandAliases": [
+    {
+      "name": "website",
+      "kind": "runtime-slash"
+    }
+  ],
   "activation": {
     "onStartup": true
   },

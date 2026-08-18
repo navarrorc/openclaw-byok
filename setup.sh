@@ -682,6 +682,12 @@ cat > "$PLUGIN_DIR/openclaw.plugin.json" <<'WEBSITEPLUGINJSON'
   "contracts": {
     "tools": ["publish_website", "close_website"]
   },
+  "commandAliases": [
+    {
+      "name": "website",
+      "kind": "runtime-slash"
+    }
+  ],
   "activation": {
     "onStartup": true
   },
@@ -987,6 +993,42 @@ const closeParameters = {
   properties: {},
 };
 
+/** Shared by publish_website (tool) and the /website command: reuse the
+ * currently open site for this session if one exists, otherwise create one.
+ * Callers are responsible for resolving `sessionKey` first (differs by
+ * caller -- see header comment for the tool's toolCallId->sessionKey path
+ * and the command handler's direct ctx.sessionKey). */
+async function publishForSession(sessionKey, html, title) {
+  let reused = true;
+  let creating = pendingCreations.get(sessionKey);
+  if (!sitesBySessionKey.has(sessionKey) && !creating) {
+    reused = false;
+    creating = createSite(sessionKey, html, title);
+    pendingCreations.set(sessionKey, creating);
+    creating.finally(() => pendingCreations.delete(sessionKey));
+  }
+
+  const site = creating ? await creating : sitesBySessionKey.get(sessionKey);
+  site.html = html;
+  site.title = title;
+
+  const url = `${site.tunnelUrl}/?k=${site.token}`;
+  return { url, reused };
+}
+
+/** Strip a ```html ... ``` (or bare ```) fence the model may wrap its output
+ * in despite being told not to -- cheap insurance, not a parser. */
+function stripCodeFence(text) {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^```(?:html)?\s*\n([\s\S]*?)\n?```$/i);
+  return match ? match[1] : trimmed;
+}
+
+const WEBSITE_COMMAND_SYSTEM_PROMPT =
+  "You build a single self-contained HTML page on request. Output ONLY the raw HTML document " +
+  "(starting with <!DOCTYPE html> or <html>) -- no markdown code fences, no commentary before or " +
+  "after. Inline all CSS and JS; do not reference external files or a build step.";
+
 export default definePluginEntry({
   id: "website",
   name: "Website",
@@ -1020,26 +1062,12 @@ export default definePluginEntry({
         const html = String(params.html ?? "");
         const title = typeof params.title === "string" ? params.title : undefined;
 
-        let reused = true;
-        let creating = pendingCreations.get(sessionKey);
-        if (!sitesBySessionKey.has(sessionKey) && !creating) {
-          // Reserve the slot synchronously, before the first await, so a
-          // second publish_website call for this same session (racing in
-          // the same turn, or a retry) joins this creation instead of
-          // spawning its own tunnel/server -- see pendingCreations comment.
-          reused = false;
-          creating = createSite(sessionKey, html, title);
-          pendingCreations.set(sessionKey, creating);
-          creating.finally(() => pendingCreations.delete(sessionKey));
-        }
-
-        const site = creating ? await creating : sitesBySessionKey.get(sessionKey);
-        // Whether we just created it or joined/reused an already-live one,
-        // make sure the served content matches what THIS call asked for.
-        site.html = html;
-        site.title = title;
-
-        const url = `${site.tunnelUrl}/?k=${site.token}`;
+        // Reserving the pendingCreations slot happens inside
+        // publishForSession, synchronously before its first await, so a
+        // second publish_website call for this same session (racing in the
+        // same turn, or a retry) joins this creation instead of spawning
+        // its own tunnel/server -- see pendingCreations comment.
+        const { url, reused } = await publishForSession(sessionKey, html, title);
         return {
           content: [{ type: "text", text: `${reused ? "Website updated" : "Website published"}: ${url}` }],
           details: { url, reused },
@@ -1066,6 +1094,83 @@ export default definePluginEntry({
         return {
           content: [{ type: "text", text: "Website closed." }],
           details: { closed: true },
+        };
+      },
+    });
+
+    // --- /website slash command ---
+    //
+    // Two designs were viable per the SDK's own types: (1) light preprocessing
+    // + `continueAgent: true`, letting the normal agent turn generate the HTML
+    // and call publish_website itself, or (2) the handler generates the HTML
+    // itself via the runtime's LLM-completion helper and publishes directly,
+    // fully bypassing the agent loop. Went with (2): `continueAgent`'s prompt-
+    // passing mechanics (does the continued turn see the raw `/website ...`
+    // text, or something rewritten by this handler?) are undocumented -- not
+    // one line about it beyond a single feature-matrix table cell in
+    // sdk-overview.md -- and it appears in ZERO of the bundled extensions that
+    // register commands (memory-core, device-pair, workboard, phone-control,
+    // talk-voice, active-memory all grepped clean for it). Design (2), by
+    // contrast, is a real documented path: `PluginCommandContext.runtimeContext.llm`
+    // is typed as `PluginRuntimeCore["llm"]`, the exact same `.complete({messages,
+    // purpose, maxTokens, temperature}) -> {text, ...}` helper sdk-runtime.md
+    // documents and gives a working example of. Simpler, deterministic, and
+    // actually confirmed to exist -- not chosen by default, chosen because the
+    // alternative couldn't be confirmed real without guessing at unstated
+    // continuation semantics on a product-facing command.
+    api.registerCommand({
+      name: "website",
+      description: "Build a page from your description and publish it as a live website.",
+      acceptsArgs: true,
+      handler: async (ctx) => {
+        const description = (ctx.args ?? "").trim();
+        if (!description) {
+          return {
+            text: "Usage: /website <what you want the page to do or show>",
+            continueAgent: false,
+          };
+        }
+
+        const llm = ctx.runtimeContext?.llm;
+        if (!llm) {
+          return {
+            text: "Website generation isn't available in this session (no LLM runtime context).",
+            continueAgent: false,
+          };
+        }
+
+        let completion;
+        try {
+          completion = await llm.complete({
+            messages: [{ role: "user", content: description }],
+            systemPrompt: WEBSITE_COMMAND_SYSTEM_PROMPT,
+            purpose: "website.command.generate",
+            maxTokens: 8192,
+            temperature: 0.4,
+          });
+        } catch (err) {
+          return {
+            text: `Couldn't generate that page: ${err instanceof Error ? err.message : String(err)}`,
+            continueAgent: false,
+          };
+        }
+
+        const html = stripCodeFence(completion.text ?? "");
+        const sessionKey = ctx.sessionKey ?? "global";
+
+        let published;
+        try {
+          published = await publishForSession(sessionKey, html, description.slice(0, 80));
+        } catch (err) {
+          return {
+            text: `Generated the page but couldn't publish it: ${err instanceof Error ? err.message : String(err)}`,
+            continueAgent: false,
+          };
+        }
+
+        return {
+          text: `${published.reused ? "Website updated" : "Website published"}: ${published.url}`,
+          continueAgent: false,
         };
       },
     });
