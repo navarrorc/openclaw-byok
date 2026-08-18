@@ -191,6 +191,26 @@ export default definePluginEntry({
 
         if (!botToken) return;
 
+        const provider = extractProvider(event as Record<string, unknown>, ctx);
+        const chatId = extractChatId(event as Record<string, unknown>, ctx);
+        const sessionKey = extractSessionKey(event as Record<string, unknown>, ctx);
+
+        if (provider !== "telegram" || !chatId || !sessionKey) return;
+
+        // A prior placeholder still tracked for this session was never
+        // claimed by reply_payload_sending -- ANY new message on this
+        // session (command or plain text) means it's abandoned, not just
+        // slow. Settle it now, independent of whether this particular
+        // message will get a new placeholder of its own, rather than
+        // leaving it orphaned (untracked, unedited) until the next 3-minute
+        // sweep pass -- a command being the abandoning message shouldn't
+        // delay that cleanup.
+        const orphaned = pendingBySession.get(sessionKey);
+        if (orphaned) {
+          pendingBySession.delete(sessionKey);
+          settleStuckPlaceholder(botToken, orphaned);
+        }
+
         // Slash commands (OpenClaw built-ins, this product's own /website,
         // and quick-menu's keyboard shortcuts -- all literally /-prefixed
         // text, see plugins/quick-menu/index.ts) are answered instantly by
@@ -207,12 +227,6 @@ export default definePluginEntry({
           : "";
         if (content.startsWith("/")) return;
 
-        const provider = extractProvider(event as Record<string, unknown>, ctx);
-        const chatId = extractChatId(event as Record<string, unknown>, ctx);
-        const sessionKey = extractSessionKey(event as Record<string, unknown>, ctx);
-
-        if (provider !== "telegram" || !chatId || !sessionKey) return;
-
         try {
           const inboundTimestamp = extractTimestamp(event as Record<string, unknown>);
           const sent = await tg(botToken, "sendMessage", {
@@ -225,15 +239,6 @@ export default definePluginEntry({
           }
           const messageId = sent.result?.message_id;
           if (typeof messageId === "number") {
-            // A prior placeholder still tracked for this session was never
-            // claimed by reply_payload_sending -- the user sending another
-            // message means it's abandoned, not just slow. Settle it now
-            // rather than silently clobbering the tracking entry below and
-            // leaving it orphaned (untracked, unedited) until whenever the
-            // next sweep pass would otherwise have caught it.
-            const orphaned = pendingBySession.get(sessionKey);
-            if (orphaned) settleStuckPlaceholder(botToken, orphaned);
-
             pendingBySession.set(sessionKey, { chatId, messageId, since: Date.now() });
           }
         } catch (err) {
