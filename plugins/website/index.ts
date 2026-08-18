@@ -17,6 +17,33 @@
 //      a `web_app` button needs its domain pre-registered with BotFather,
 //      which a fresh random *.trycloudflare.com subdomain can never satisfy.
 //
+// --- cloudflared binary path and crash-proofing (08-18 incident) ---
+//
+// This crashed a live customer gateway: `spawn("cloudflared", ...)` threw
+// `Error: spawn cloudflared ENOENT` as an unhandled 'error' event on the
+// ChildProcess, which is fatal for the whole Node process by default (not
+// just this one request) -- Docker's `restart: unless-stopped` then quietly
+// relaunched the entire container, which is why the visible symptom was
+// "the bot got stuck," not an obvious crash log.
+//
+// Root cause: setup.sh used to `docker cp` cloudflared to
+// /usr/local/bin/cloudflared, which lives in the container's writable
+// layer, NOT the /data volume. Any `docker compose up -d --force-recreate`
+// (done routinely to pick up new .env vars) discards that layer and wipes
+// the binary, while this plugin file itself (under
+// /data/workspace/.openclaw/extensions/website) survives -- so the plugin
+// kept running, found nothing to spawn, and took the gateway down with it.
+// Fixed by installing to CLOUDFLARED_PATH below, under /data, so it
+// survives recreation the same way the plugin code does.
+//
+// Regardless of where the binary lives, a spawn failure (missing binary,
+// bad permissions, OOM, anything) must never be able to crash the gateway
+// again: every ChildProcess this file creates gets a permanent
+// `.on("error", ...)` listener (so the EventEmitter always has one, for the
+// life of the process, not just during startup) plus a temporary one inside
+// waitForTunnelUrl that turns a startup-time spawn failure into a normal
+// rejected Promise instead of an unhandled event. See createSite() below.
+//
 // --- Tool-call identity: the real finding from live testing (08-18) ---
 //
 // AgentTool.execute has signature (toolCallId, params, signal, onUpdate) --
@@ -141,12 +168,18 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 const COOKIE_NAME = "website_k";
 const TUNNEL_URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
 const TUNNEL_STARTUP_TIMEOUT_MS = 20_000;
+
+/** Persistent path under the /data volume, installed there by setup.sh --
+ * NOT /usr/local/bin (container writable layer, wiped on every
+ * --force-recreate). See header comment for the incident this fixes. */
+const CLOUDFLARED_PATH = "/data/bin/cloudflared";
 
 /** How long a bare `/website`'s "awaiting description" state stays claimable.
  * Distinct concern from sitesBySessionKey's own no-timeout policy (that one
@@ -258,6 +291,17 @@ function waitForTunnelUrl(proc) {
       cleanup();
       reject(new Error(`cloudflared exited before printing a tunnel URL (code ${code}): ${buf.slice(-1000)}`));
     };
+    // Spawn failures (missing binary, bad permissions, ...) surface
+    // asynchronously as an 'error' event on `proc`, never as a thrown
+    // exception -- a try/catch around spawn() would never see this. Without
+    // a listener here (or the permanent one added in createSite right after
+    // spawn()), this is an unhandled EventEmitter 'error', which is fatal to
+    // the whole Node process by default. This one turns it into a normal
+    // rejection for this request instead.
+    const onError = (err) => {
+      cleanup();
+      reject(new Error(`failed to start cloudflared (${CLOUDFLARED_PATH}): ${err.message}`));
+    };
     const timer = setTimeout(() => {
       cleanup();
       reject(new Error(`cloudflared did not print a tunnel URL within ${TUNNEL_STARTUP_TIMEOUT_MS}ms: ${buf.slice(-1000)}`));
@@ -267,10 +311,12 @@ function waitForTunnelUrl(proc) {
       proc.stdout?.off("data", onData);
       proc.stderr?.off("data", onData);
       proc.off("exit", onExit);
+      proc.off("error", onError);
     }
     proc.stdout?.on("data", onData);
     proc.stderr?.on("data", onData);
     proc.on("exit", onExit);
+    proc.on("error", onError);
   });
 }
 
@@ -289,10 +335,35 @@ async function createSite(sessionKey, html, title) {
   });
   const port = server.address().port;
 
-  const proc = spawn("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], {
+  // Cheap upfront check for the common case (binary genuinely missing, e.g.
+  // a container recreation that predates this fix) so the reported error is
+  // immediate and specific rather than whatever spawn()'s ENOENT happens to
+  // say. Not a substitute for the 'error' handlers below -- this can't catch
+  // every failure mode (permissions, a binary that vanishes between the
+  // check and the spawn, etc.), just the most common one, faster.
+  if (!fs.existsSync(CLOUDFLARED_PATH)) {
+    try {
+      server.close();
+    } catch {
+      // already closed
+    }
+    throw new Error(`cloudflared not found at ${CLOUDFLARED_PATH} -- was setup.sh's install step run?`);
+  }
+
+  const proc = spawn(CLOUDFLARED_PATH, ["tunnel", "--url", `http://127.0.0.1:${port}`], {
     stdio: ["ignore", "pipe", "pipe"],
   });
   site.cloudflaredProc = proc;
+  // Permanent listener for the life of this process (not just the startup
+  // window waitForTunnelUrl below covers) -- an EventEmitter's 'error' event
+  // is fatal to the whole gateway process if nothing is ever listening, and
+  // waitForTunnelUrl's own listener is removed once startup finishes. This
+  // is the actual fix for the incident described in the header comment:
+  // whatever goes wrong with this child process, ever, gets logged for this
+  // one session instead of taking down every other conversation.
+  proc.on("error", (err) => {
+    console.error(`[website] cloudflared process error (session ${sessionKey}):`, err.message);
+  });
   // cloudflared can die on its own (network blip, process limits); if that
   // happens while we're still tracking this site, stop pretending it's
   // live so the next publish_website actually recreates a working tunnel
@@ -381,7 +452,17 @@ async function publishForSession(sessionKey, html, title) {
     reused = false;
     creating = createSite(sessionKey, html, title);
     pendingCreations.set(sessionKey, creating);
-    creating.finally(() => pendingCreations.delete(sessionKey));
+    // .finally() returns a NEW promise that mirrors creating's rejection --
+    // `creating` itself is properly handled by the `await creating` below
+    // (or by whichever concurrent caller joined this same in-flight
+    // creation), but this discarded `.finally()` promise is not awaited by
+    // anyone. Left uncaught, that's a second, independent unhandled
+    // rejection for the exact same failure -- and an unhandled rejection is
+    // fatal to the whole process by default, same as the unhandled
+    // ChildProcess 'error' event this file otherwise guards against. Caught
+    // live by scripts/test-website-crash-safety.mjs -- run it after
+    // touching this function.
+    creating.finally(() => pendingCreations.delete(sessionKey)).catch(() => {});
   }
 
   const site = creating ? await creating : sitesBySessionKey.get(sessionKey);
@@ -598,11 +679,28 @@ export default definePluginEntry({
         // second publish_website call for this same session (racing in the
         // same turn, or a retry) joins this creation instead of spawning
         // its own tunnel/server -- see pendingCreations comment.
-        const { url, reused } = await publishForSession(sessionKey, html, title);
-        return {
-          content: [{ type: "text", text: `${reused ? "Website updated" : "Website published"}: ${url}` }],
-          details: { url, reused },
-        };
+        //
+        // Unlike the other two callers of publishForSession (the /website
+        // command handler and the claimed-follow-up message_received
+        // handler), this one previously had no try/catch: an uncaught
+        // rejection here becomes an unhandled promise rejection, which is
+        // also fatal to the whole process by default (not the EventEmitter
+        // 'error' path this file otherwise guards against, but the same
+        // failure mode from this tool's point of view). Report it as a
+        // normal failed tool call instead.
+        try {
+          const { url, reused } = await publishForSession(sessionKey, html, title);
+          return {
+            content: [{ type: "text", text: `${reused ? "Website updated" : "Website published"}: ${url}` }],
+            details: { url, reused },
+          };
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text", text: `Couldn't publish that page: ${message}` }],
+            details: { url: null, reused: false, error: message },
+          };
+        }
       },
     });
 
