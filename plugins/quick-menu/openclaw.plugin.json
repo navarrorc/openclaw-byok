@@ -1,7 +1,7 @@
 {
   "id": "quick-menu",
   "name": "Quick Menu",
-  "description": "Sends a persistent Telegram custom keyboard of curated commands (including /website) once per session.",
+  "description": "Defines the curated Telegram quick-menu keyboard (including /website); attached via thinking-bubble's placeholder send, not a standalone message.",
   "version": "1.0.0",
   "activation": {
     "onStartup": true

@@ -1,55 +1,46 @@
 // Quick Menu plugin
 //
-// Sends a persistent Telegram custom keyboard (Bot API `ReplyKeyboardMarkup`
-// -- the grid revealed by the toggle button next to the text input, distinct
-// from the native "/" autocomplete list `setMyCommands` already populates)
-// once per session, with a curated set of this product's most useful
+// Defines the persistent Telegram custom keyboard (Bot API
+// `ReplyKeyboardMarkup` -- the grid revealed by the toggle button next to
+// the text input, distinct from the native "/" autocomplete list
+// `setMyCommands` already populates) of this product's most useful
 // commands.
 //
-// --- Why button text IS the literal command, not a friendly label ---
+// --- No standalone announcement message ---
 //
-// FarmOps' own bridges (claudeops_bridge.py, nelita_bridge.py) always use
-// friendly emoji labels ("📊 Usage & Pool") translated in-process to the
-// real command via a KEYBOARD_LABELS dict, then re-routed by calling their
-// own handle_command() directly. That works because FarmOps owns its whole
-// message pipeline in one process. This plugin doesn't: OpenClaw owns
-// native command routing, and a plugin has no confirmed way to
-// programmatically invoke a built-in command (`/tts`, `/usage`, ...) and
-// relay its reply back. `api.runtime.gateway.request(...)` exists
-// (docs/plugins/sdk-runtime.md) but is explicitly documented as restricted
-// to trusted/bundled plugins -- "calls from arbitrary external plugins are
-// rejected" -- and `message_received` (the one hook this plugin family
-// already knows fires reliably, see thinking-bubble/index.ts and
-// website/index.ts) is observation-only, the same ceiling website/index.ts
-// hit designing around `inbound_claim`. So every button's `text` here is
-// the exact command string a user would type (e.g. "/tts on"). Tapping one
-// sends that literal text as a normal message -- indistinguishable from
-// typing it by hand, hits OpenClaw's real command router with zero custom
-// interception code. Less flashy than emoji labels, but reliable, and
-// nothing here can produce a stray duplicate reply or a silent no-op the
-// way a fragile translation layer could.
+// This plugin used to send a dedicated "Quick menu ready" message on the
+// first message_received of a session to attach the keyboard, tracked
+// in-memory "once per session". Rob (product owner), 08-18, with a
+// screenshot: that message re-appeared right after a real command reply
+// (e.g. a quick-menu button sending `/usage cost`) because the "new
+// session" tracking didn't exclude slash-command messages -- the same
+// category of gap thinking-bubble/index.ts's header documents fixing for
+// its own placeholder. But the ask wasn't "de-duplicate it", it was
+// "remove it entirely, permanently": after a couple of uses the button
+// grid is self-explanatory, and repeating the explanation is just noise.
 //
-// --- Trigger: once per session, on the first message_received ---
+// Telegram's Bot API has no message-free way to register a persistent
+// custom keyboard -- `reply_markup` can only be attached to an actual
+// outbound message. But a `ReplyKeyboardMarkup` is chat-level client
+// state, not tied to the lifetime of the message that carried it: it
+// persists after that message is deleted (confirmed against Telegram
+// bot-developer references -- "the original message and the reply
+// keyboard are two different unrelated entities"; deleting one does not
+// affect the other). So instead of a dedicated send,
+// `thinking-bubble/index.ts` attaches QUICK_MENU_KEYBOARD (duplicated
+// there, see its header) to its own placeholder message -- which already
+// goes out via a raw Telegram `sendMessage` call on essentially every
+// non-command first message and gets deleted moments later anyway. Zero
+// new visible chat content, no per-session/per-chat state to track or
+// persist across restarts, and no repeat-firing bug is possible because
+// there's no separate trigger left to misfire.
 //
-// The docs list a `session_start` hook (reason: "new" on a genuinely fresh
-// session) that would be the more precise trigger for "greet a new
-// session." Not used here: this codebase has already spent real time on
-// hooks that are documented but don't fire in this build (before_agent_run,
-// message_sending -- see thinking-bubble/index.ts's header), and
-// `session_start` hasn't been proven live the way `message_received` has
-// across two sibling plugins. So: track "have we greeted this session" in
-// a plain in-memory Set keyed by sessionKey, and send the menu on the first
-// message_received for a session not yet in it. Same
-// single-process/single-VPS assumption website/index.ts already documents
-// for its own sessionKey fallback -- resets on gateway restart, which just
-// means the menu resends once more; harmless.
-//
-// tg()/extractChatId/extractProvider/extractSessionKey below are
-// intentionally duplicated from thinking-bubble/index.ts and
-// website/index.ts rather than shared -- each plugin ships as an
-// independent workspace-extension directory (see setup.sh's docker cp
-// steps), so importing across them would mean inventing shared-file
-// plumbing just to avoid ~30 lines of duplication. Not worth it.
+// This plugin still ships and loads (openclaw.plugin.json, setup.sh) as
+// the canonical, curated definition of the button grid below --
+// duplicated into thinking-bubble/index.ts rather than imported, matching
+// this codebase's established pattern of duplicating small pieces (tg(),
+// extractChatId, ...) across independent plugin workspace-extension
+// directories instead of inventing cross-plugin import plumbing.
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
@@ -65,7 +56,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
  * hidden prior state. `/usage cost` is a stable, idempotent local cost
  * summary -- the actual "check my spend" behavior a BYOK customer wants
  * from a button, not a footer-verbosity toggle. */
-const KEYBOARD_ROWS: { text: string }[][] = [
+export const KEYBOARD_ROWS: { text: string }[][] = [
   [{ text: "/website" }, { text: "/new" }],
   [{ text: "/tts on" }, { text: "/tts off" }],
   [{ text: "/tts status" }, { text: "/usage cost" }],
@@ -82,107 +73,15 @@ const KEYBOARD_ROWS: { text: string }[][] = [
  * string) since this goes out over an `application/json` POST body, where
  * Telegram's Bot API accepts `reply_markup` as a native nested object;
  * stringifying is only required for multipart/form-encoded requests. */
-const QUICK_MENU_KEYBOARD = { keyboard: KEYBOARD_ROWS, resize_keyboard: true };
-
-const QUICK_MENU_INTRO =
-  "Quick menu ready ⬇️\n\n" +
-  "Tap the keyboard icon next to the text box any time to bring these back up. " +
-  "Each button sends the exact command shown -- same as typing it yourself.";
-
-/** sessionKey -> already greeted. Bounded the same way website/index.ts
- * bounds sessionKeyByToolCallId: entries are never removed except by this
- * cap, so a long-running gateway that accumulates many distinct sessions
- * can't grow this unboundedly. */
-const MAX_TRACKED_SESSIONS = 200;
-const greetedSessionKeys = new Set<string>();
-
-async function tg(botToken: string, method: string, body: Record<string, unknown>) {
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const json = (await res.json().catch(() => ({}))) as { ok?: boolean; description?: string };
-  if (!json.ok) {
-    throw new Error(`Telegram ${method} failed: ${json.description ?? res.status}`);
-  }
-  return json;
-}
-
-function extractChatId(event: Record<string, unknown>, ctx: Record<string, unknown>): string | undefined {
-  const metadata = (event as { metadata?: Record<string, unknown> }).metadata ?? {};
-  const candidates = [
-    (metadata as { senderId?: string | number }).senderId,
-    (event as { chatId?: string | number }).chatId,
-    (event as { senderId?: string | number }).senderId,
-    (ctx as { chatId?: string | number }).chatId,
-    (ctx as { senderId?: string | number }).senderId,
-    (ctx as { channelContext?: { chat?: { id?: string | number } } }).channelContext?.chat?.id,
-  ];
-  for (const c of candidates) {
-    if (c !== undefined && c !== null && String(c).length > 0) return String(c);
-  }
-  return undefined;
-}
-
-function extractProvider(event: Record<string, unknown>, ctx: Record<string, unknown>): string | undefined {
-  const metadata = (event as { metadata?: Record<string, unknown> }).metadata ?? {};
-  return (
-    (metadata as { provider?: string }).provider ??
-    (event as { channel?: string }).channel ??
-    (ctx as { messageProvider?: string }).messageProvider ??
-    (ctx as { channel?: string }).channel
-  );
-}
-
-function extractSessionKey(event: Record<string, unknown>, ctx: Record<string, unknown>): string | undefined {
-  return (
-    (event as { sessionKey?: string }).sessionKey ??
-    (ctx as { sessionKey?: string }).sessionKey
-  );
-}
+export const QUICK_MENU_KEYBOARD = { keyboard: KEYBOARD_ROWS, resize_keyboard: true };
 
 export default definePluginEntry({
   id: "quick-menu",
   name: "Quick Menu",
-  description: "Sends a persistent Telegram custom keyboard of curated commands once per session.",
-  register(api) {
-    api.on(
-      "message_received",
-      async (event) => {
-        const ctx = (event.context ?? {}) as Record<string, unknown>;
-        const botToken = process.env.QUICK_MENU_BOT_TOKEN;
-        if (!botToken) return;
-
-        const provider = extractProvider(event as Record<string, unknown>, ctx);
-        const chatId = extractChatId(event as Record<string, unknown>, ctx);
-        const sessionKey = extractSessionKey(event as Record<string, unknown>, ctx);
-
-        if (provider !== "telegram" || !chatId || !sessionKey) return;
-        if (greetedSessionKeys.has(sessionKey)) return;
-
-        // Claim now, before any await, so a duplicate/retried event for the
-        // same session can't double-send.
-        if (greetedSessionKeys.size >= MAX_TRACKED_SESSIONS) {
-          const oldest = greetedSessionKeys.values().next().value;
-          if (oldest !== undefined) greetedSessionKeys.delete(oldest);
-        }
-        greetedSessionKeys.add(sessionKey);
-
-        try {
-          await tg(botToken, "sendMessage", {
-            chat_id: chatId,
-            text: QUICK_MENU_INTRO,
-            reply_markup: QUICK_MENU_KEYBOARD,
-          });
-        } catch (err) {
-          console.error(
-            "[quick-menu] failed to send quick menu:",
-            err instanceof Error ? err.message : String(err),
-          );
-        }
-      },
-      { priority: 10 },
-    );
+  description: "Defines the curated Telegram quick-menu keyboard; attached via thinking-bubble's placeholder send, not a standalone message.",
+  register() {
+    // No hooks: this plugin only defines the keyboard content above. The
+    // Telegram send that actually carries it to the client happens in
+    // thinking-bubble/index.ts -- see this file's header comment for why.
   },
 });

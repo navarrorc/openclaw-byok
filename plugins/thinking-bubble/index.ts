@@ -52,8 +52,45 @@
 // but NO chat or sender id at all (confirmed live 08-18: reply_payload_sending
 // events look like {payload, kind, channel, sessionKey, runId, usageState},
 // with an empty ctx). sessionKey is the one field both events share.
+//
+// --- Also carries the quick-menu keyboard (08-18) ---
+//
+// The placeholder sendMessage below now also attaches QUICK_MENU_KEYBOARD
+// (a `reply_markup`), so this send is what registers the product's
+// persistent Telegram quick-menu keyboard with the client -- see
+// quick-menu/index.ts's header for the full story of why that plugin no
+// longer sends its own dedicated "Quick menu ready" message. Short
+// version: Telegram's Bot API only accepts `reply_markup` on a real
+// outbound message, and this placeholder is a raw `sendMessage` call this
+// codebase directly controls (unlike the OpenClaw-normalized
+// `reply_payload_sending` path, whose `ReplyPayload` type -- checked
+// against dist/types-C5Sz_b28.d.ts and the outbound Telegram send path in
+// dist/send-BgA996pw.js -- only threads `buttons`/`presentation` through
+// to Telegram's `inline_keyboard`; there is no field anywhere in that
+// pipeline that reaches a `ReplyKeyboardMarkup`, so rewriting the payload
+// in that hook cannot carry one). The keyboard persists client-side
+// independent of this placeholder's own delete-before-real-reply
+// lifecycle: a Telegram `ReplyKeyboardMarkup` is chat-level state, not
+// tied to the message that attached it. QUICK_MENU_KEYBOARD is duplicated
+// from quick-menu/index.ts (which still owns the curated button content)
+// rather than imported, matching every other tg()-style duplication in
+// this file.
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+
+/** Duplicated from quick-menu/index.ts's KEYBOARD_ROWS/QUICK_MENU_KEYBOARD
+ * -- see that file for the rationale behind this exact button set. Kept in
+ * sync by hand since each plugin ships as an independent workspace-
+ * extension directory (no shared import path between them). */
+const QUICK_MENU_KEYBOARD = {
+  keyboard: [
+    [{ text: "/website" }, { text: "/new" }],
+    [{ text: "/tts on" }, { text: "/tts off" }],
+    [{ text: "/tts status" }, { text: "/usage cost" }],
+    [{ text: "/status" }, { text: "/help" }],
+  ],
+  resize_keyboard: true,
+};
 
 type Placeholder = { chatId: string; messageId: number; since: number };
 
@@ -233,6 +270,7 @@ export default definePluginEntry({
             chat_id: chatId,
             text: placeholderText(),
             parse_mode: "HTML",
+            reply_markup: QUICK_MENU_KEYBOARD,
           });
           if (typeof inboundTimestamp === "number") {
             console.log(`[thinking-bubble] placeholder sent ${Date.now() - inboundTimestamp}ms after inbound message`);
