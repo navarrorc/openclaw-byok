@@ -1,7 +1,7 @@
 {
   "id": "quick-menu",
   "name": "Quick Menu",
-  "description": "Defines the curated Telegram quick-menu keyboard (including /website); attached via thinking-bubble's placeholder send, not a standalone message.",
+  "description": "Sends the curated Telegram quick-menu keyboard as a standalone, permanent message on /start and /new -- matching FarmOps' proven pattern of never attaching reply_markup to a message that gets deleted or edited.",
   "version": "1.0.0",
   "activation": {
     "onStartup": true

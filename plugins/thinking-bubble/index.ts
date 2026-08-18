@@ -15,6 +15,28 @@
 // the actual send/delete calls are just plain HTTPS, nothing
 // framework-specific.
 //
+// --- Quick-menu keyboard: fully decoupled from this file now ---
+//
+// Two prior versions of this plugin attached the quick-menu
+// ReplyKeyboardMarkup to this file's placeholder message -- first as a
+// plain send-then-delete placeholder, then as a "permanent carrier"
+// placeholder that got edited-in-place instead of deleted. Both were
+// wrong for the same underlying reason, confirmed against FarmOps'
+// own hard-won 2026-07-25 lesson (`ai-farm/scripts/bridge_common.py`
+// clear_chat's docstring): a keyboard-carrying message must never be
+// something that gets deleted OR edited away, full stop -- not "deleted
+// less often" or "edited instead of deleted", but never touched again
+// after it's sent. Coupling the keyboard to this placeholder's lifecycle
+// at all was the mistake, regardless of which specific lifecycle event
+// (delete vs. edit) triggered the loss Rob's real device testing (08-18)
+// kept turning up. The fix lives entirely in plugins/quick-menu/index.ts
+// now: a standalone message it sends directly on /start and /new,
+// completely independent of this file's send-then-delete placeholder.
+// This file has zero reply_markup involvement, matching FarmOps' own
+// clean separation between its placeholder sends (TG.send_dim, never
+// carries reply_markup) and its keyboard attach sites (TG.send on
+// /start, /help, /new, clear_chat -- always a permanent message).
+//
 // Note: before_agent_run was tried first and never fired even once, for
 // any real message (confirmed live 08-18) -- it's gated behind
 // hooks.allowConversationAccess and something about that permission grant
@@ -53,19 +75,16 @@
 // events look like {payload, kind, channel, sessionKey, runId, usageState},
 // with an empty ctx). sessionKey is the one field both events share.
 //
-// --- Quick-menu keyboard: two real bugs found in real device testing (08-18) ---
+// --- Why /start is the one slash command not skipped below ---
 //
-// Rob's report after tapping through the shipped design on a real phone:
-// "/start doesn't show the toggle button. A plain 'hi' does show it, but it
-// disappears after the response." Both are confirmed real, distinct bugs:
-//
-// Bug 1 -- /start never got a placeholder at all. The categorical
+// Rob's report after tapping through an earlier design on a real phone:
+// "/start doesn't show the toggle button." Root cause: the categorical
 // slash-command skip below (content.startsWith("/")) caught /start along
-// with every other command, so it never got QUICK_MENU_KEYBOARD attached.
-// But /start is NOT one of OpenClaw's fast built-ins: confirmed by reading
+// with every other command, so it never got a placeholder at all. But
+// /start is NOT one of OpenClaw's fast built-ins: confirmed by reading
 // dist/commands-registry.data-BKgJ3WoC.js's native-command table (which
-// lists /help, /status, /usage, etc. by textAlias) -- there is no "start"
-// entry anywhere in it. With no bot.command("start", ...) handler
+// lists /help, /status, /usage, /new, etc. by textAlias) -- there is no
+// "start" entry anywhere in it. With no bot.command("start", ...) handler
 // registered (dist/telegram-ingress-spool-Dd3cDhXe.js:989-992 only
 // registers handlers for that table's entries), a real /start falls
 // through to the generic message handler at :4268 -> processInboundMessage
@@ -73,135 +92,15 @@
 // text takes, which DOES fire reply_payload_sending. That matches the
 // earlier live observation that /start produces a natural, personalized,
 // LLM-generated welcome -- it's a real agent turn, not a template. So
-// /start is now an explicit exception to the slash-command skip below: it
-// gets a placeholder like normal chat. /help, /status, /usage, /new,
-// /tts, /website, and the quick-menu's own button commands all stay
-// skipped -- they really are instant built-ins with no reply_payload_sending.
-//
-// Bug 2 -- the placeholder that carries the keyboard gets deleted, and
-// deletion may revert the keyboard. The previous design assumed (from an
-// unverified WebSearch) that a Telegram ReplyKeyboardMarkup is chat-level
-// state that survives deletion of the message that introduced it. Re-checked
-// properly this time: Telegram's own Bot API docs for ReplyKeyboardMarkup
-// only say the keyboard stays displayed "until a new keyboard is sent by a
-// bot" -- deleteMessage is never mentioned in that context either direction,
-// in either method's doc entry. No real developer report of this *specific*
-// interaction (send keyboard, then delete that exact message) turned up
-// anywhere searched -- it appears to be a genuinely untested edge case in
-// the public record, not a documented guarantee. Telegram's own bug tracker
-// also shows a real history of reply-keyboard persistence being
-// client-inconsistent even for parameters that ARE documented (e.g.
-// is_persistent handling, bugs.telegram.org/c/25708 and /c/18395). Given
-// that history and Rob's own device directly showing the keyboard vanish,
-// the "survives deletion" assumption is not safe to build on. Fix: never
-// rely on a deleted message to carry the keyboard. See "permanent carrier"
-// below.
-//
-// What does NOT work as an alternative: piggybacking on reply_payload_sending
-// instead (rewriting the real, never-deleted final answer to carry
-// reply_markup). Re-verified directly against source, not just re-asserted:
-// ReplyPayload (dist/types-C5Sz_b28.d.ts:9-53) has no reply_markup field at
-// all -- its only escape hatch is channelData?.telegram, and every consumer
-// of that (dist/delivery-BzuQz4xo.js:712+, dist/send-BgA996pw.js's
-// buildInlineKeyboard :349-354) only ever reads a `buttons` array and turns
-// it into Telegram's `inline_keyboard` -- a different, incompatible keyboard
-// type from ReplyKeyboardMarkup (toInlineKeyboardButton drops any button
-// without a url/callback_data/web_app, so a plain {text: "/foo"}
-// custom-keyboard button is filtered out even if forced through). Genuinely
-// a dead end, confirmed by tracing the compiled send path, not assumed.
-//
-// --- The fix: a durable, never-deleted "permanent carrier" message ---
-//
-// The FIRST placeholder ever sent to a given chat (tracked durably in
-// registeredKeyboardChats.json under /data, so it survives container
-// restarts/redeploys, not the old in-memory-Set approach that reset on
-// every deploy) is the only one that ever gets QUICK_MENU_KEYBOARD attached,
-// and it is never deleted. Instead of deleteMessage in reply_payload_sending,
-// it gets editMessageText'd into a short, one-line, permanent notice and
-// left in the chat forever -- the real answer still arrives as a normal
-// fresh message right after, same as always. Every later placeholder in
-// that chat (and every placeholder in every other chat once it's had its
-// own first one) carries no reply_markup at all and behaves exactly as
-// before the whole keyboard feature existed: plain send-then-delete --
-// deliberately not re-sent on every turn, since that would put the exact
-// send-then-delete-a-keyboard-carrier pattern bug 2 distrusts right back on
-// every later message for zero benefit (the keyboard is already registered
-// from the one surviving carrier). This satisfies all of: fires on /start
-// (bug 1 fix makes /start eligible for a placeholder at all), the carrier
-// is never removed afterward (bug 2 fix), and there is exactly one short
-// notice ever per chat -- not a repeat on every message.
-//
-// QUICK_MENU_KEYBOARD is duplicated from quick-menu/index.ts (which still
-// owns the curated button content) rather than imported, matching every
-// other tg()-style duplication in this file.
+// /start is an explicit exception to the slash-command skip below: it gets
+// a placeholder like normal chat. /help, /status, /usage, /new, /tts,
+// /website, and the quick-menu's own button commands all stay skipped --
+// they really are instant built-ins with no reply_payload_sending. (/new
+// was re-confirmed as a native built-in, not a special case, when the
+// quick-menu keyboard fix was designed -- key: "new", nativeName: "new",
+// textAlias: "/new", tier: "essential" in that same registry table.)
 
-import fs from "node:fs";
-import path from "node:path";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-
-/** Duplicated from quick-menu/index.ts's KEYBOARD_ROWS/QUICK_MENU_KEYBOARD
- * -- see that file for the rationale behind this exact button set. Kept in
- * sync by hand since each plugin ships as an independent workspace-
- * extension directory (no shared import path between them). */
-const QUICK_MENU_KEYBOARD = {
-  keyboard: [
-    [{ text: "/website" }, { text: "/new" }],
-    [{ text: "/tts on" }, { text: "/tts off" }],
-    [{ text: "/tts status" }, { text: "/usage cost" }],
-    [{ text: "/status" }, { text: "/help" }],
-  ],
-  resize_keyboard: true,
-};
-
-/** Shown, once ever, on the one placeholder per chat that becomes the
- * permanent keyboard carrier (see header comment). Deliberately one line --
- * Rob was explicit that a repeated "quick menu ready" essay is not wanted;
- * this is the fallback for the case where there turned out to be no way to
- * attach reply_markup to the real, never-deleted final answer instead. */
-const KEYBOARD_CARRIER_TEXT = "⌨️ Quick menu ready — tap the icon beside the message box anytime.";
-
-/** Durable (survives container restarts/redeploys) record of which chats
- * already got their permanent keyboard-carrier message, so it's sent
- * exactly once per chat ever -- not per session (/new resets the session,
- * not the chat) and not per in-memory-Set-that-resets-on-deploy like the
- * quick-menu plugin's old standalone-announcement design did. Lives under
- * /data (the persistent volume -- see docker-compose.yml's openclaw-data
- * mount), in its own state directory rather than inside the extensions/
- * install dir, since setup.sh's docker cp only touches specific files
- * there and this shouldn't be confused with plugin code. */
-const KEYBOARD_STATE_DIR = "/data/plugin-state/thinking-bubble";
-const KEYBOARD_STATE_FILE = path.join(KEYBOARD_STATE_DIR, "keyboard-registered-chats.json");
-
-function loadRegisteredKeyboardChats(): Set<string> {
-  try {
-    const raw = fs.readFileSync(KEYBOARD_STATE_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return new Set(parsed.map(String));
-  } catch {
-    // First boot, or file doesn't exist yet -- start empty either way.
-  }
-  return new Set();
-}
-
-const registeredKeyboardChats = loadRegisteredKeyboardChats();
-
-/** Marks a chat as having received its permanent carrier and persists
- * immediately -- swallows/logs failure the same way every other
- * best-effort call in this file does; worst case on a write failure is one
- * chat re-evaluating "is this my first placeholder?" on its next message,
- * which just produces one more never-deleted carrier, not a crash. */
-function markChatKeyboardRegistered(chatId: string) {
-  registeredKeyboardChats.add(chatId);
-  try {
-    fs.mkdirSync(KEYBOARD_STATE_DIR, { recursive: true });
-    fs.writeFileSync(KEYBOARD_STATE_FILE, JSON.stringify([...registeredKeyboardChats]));
-  } catch (err) {
-    console.error(
-      "[thinking-bubble] failed to persist registered keyboard chats:",
-      err instanceof Error ? err.message : String(err),
-    );
-  }
-}
 
 /** /start is the one slash command that must NOT be skipped -- see header
  * comment for why it's a real agent turn, not a fast built-in. Matches
@@ -215,11 +114,6 @@ type Placeholder = {
   chatId: string;
   messageId: number;
   since: number;
-  /** True for the one placeholder per chat that carries the quick-menu
-   * keyboard permanently -- resolved by editing it in place, never by
-   * deleteMessage (see header comment for why deletion isn't safe to rely
-   * on here). */
-  permanentCarrier: boolean;
 };
 
 const pendingBySession = new Map<string, Placeholder>();
@@ -388,9 +282,7 @@ export default definePluginEntry({
         // use or display the thinking bubble... The bubble would only come
         // when there's an LLM involved." /start is the one exception --
         // it's not a fast built-in, it's a real agent turn (see header
-        // comment) and needs a placeholder like normal chat, most
-        // importantly so it can become the permanent keyboard carrier for
-        // brand new chats.
+        // comment) and needs a placeholder like normal chat.
         const content = typeof (event as { content?: unknown }).content === "string"
           ? (event as { content: string }).content.trim()
           : "";
@@ -398,26 +290,17 @@ export default definePluginEntry({
 
         try {
           const inboundTimestamp = extractTimestamp(event as Record<string, unknown>);
-          const permanentCarrier = !registeredKeyboardChats.has(chatId);
-          // reply_markup only goes on the permanent carrier. Attaching it to
-          // every placeholder (as a prior version of this fix did) would put
-          // the exact same send-then-delete pattern back on every later
-          // message -- the thing bug 2 above says isn't safe to rely on --
-          // for zero benefit, since the keyboard is already registered by
-          // the chat's one surviving carrier.
           const sent = await tg(botToken, "sendMessage", {
             chat_id: chatId,
             text: placeholderText(),
             parse_mode: "HTML",
-            ...(permanentCarrier ? { reply_markup: QUICK_MENU_KEYBOARD } : {}),
           });
           if (typeof inboundTimestamp === "number") {
             console.log(`[thinking-bubble] placeholder sent ${Date.now() - inboundTimestamp}ms after inbound message`);
           }
           const messageId = sent.result?.message_id;
           if (typeof messageId === "number") {
-            if (permanentCarrier) markChatKeyboardRegistered(chatId);
-            pendingBySession.set(sessionKey, { chatId, messageId, since: Date.now(), permanentCarrier });
+            pendingBySession.set(sessionKey, { chatId, messageId, since: Date.now() });
           }
         } catch (err) {
           console.error("[thinking-bubble] failed to send placeholder:", err instanceof Error ? err.message : String(err));
@@ -440,27 +323,6 @@ export default definePluginEntry({
         if (!placeholder) return; // nothing we're tracking for this session
 
         pendingBySession.delete(sessionKey); // one-shot: don't act twice for the same placeholder
-
-        if (placeholder.permanentCarrier) {
-          // This is the one placeholder for this chat that must never be
-          // deleted (see header comment) -- turn it into the short,
-          // permanent keyboard notice instead. Deliberately omits
-          // reply_markup here: editMessageText's reply_markup parameter
-          // only accepts InlineKeyboardMarkup, not ReplyKeyboardMarkup, so
-          // passing anything would either be rejected or silently wrong --
-          // the keyboard was already registered by the original sendMessage
-          // and leaving reply_markup out of the edit doesn't touch that.
-          try {
-            await tg(botToken, "editMessageText", {
-              chat_id: placeholder.chatId,
-              message_id: placeholder.messageId,
-              text: KEYBOARD_CARRIER_TEXT,
-            });
-          } catch (err) {
-            console.error("[thinking-bubble] failed to settle permanent keyboard carrier:", err instanceof Error ? err.message : String(err));
-          }
-          return;
-        }
 
         // Delete the placeholder and let the normal send path deliver the
         // real answer as a fresh message -- the bubble should disappear,
