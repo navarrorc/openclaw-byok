@@ -37,6 +37,61 @@
 // carries reply_markup) and its keyboard attach sites (TG.send on
 // /start, /help, /new, clear_chat -- always a permanent message).
 //
+// --- Fix: reply_dispatch-delivered replies never fire reply_payload_sending ---
+//
+// Confirmed live, 08-19: `/website`'s bare-command follow-up and `/clearchat`
+// were both moved today from `message_received` onto `api.on('reply_dispatch',
+// handler)` returning `{ handled: true, ... }` (plugins/website/index.ts and
+// plugins/quick-menu/index.ts) -- the correct fix for a DIFFERENT bug, since
+// `reply_dispatch`'s `handled: true` is a structural short-circuit that stops
+// the LLM from ALSO replying conversationally to the same message (confirmed
+// against this deployed version's own dispatch-from-config.ts, same finding
+// documented in those two files' own headers). But `reply_payload_sending`
+// below only fires as part of the SAME normal agent-turn pipeline that
+// short-circuit deliberately bypasses -- so a placeholder for a message that
+// gets claimed via `reply_dispatch` has no trigger left to delete it. It sits
+// until the 3-minute safety net above wrongly edits it to "didn't come
+// through" next to a reply that actually arrived fine.
+//
+// Investigated and rejected: this file registering its OWN `reply_dispatch`
+// handler to notice and delete the placeholder itself. Confirmed against this
+// deployed version's own docs (`docs/plugins/sdk-overview.md`: "`reply_dispatch`:
+// returning `{ handled: true, ... }` is terminal. Once any handler claims
+// dispatch, lower-priority handlers ... are skipped.") and `docs/plugins/hooks.md`
+// ("Handlers run sequentially in descending priority..."): `reply_dispatch`
+// fires for EVERY inbound message, not just ones a plugin ends up claiming --
+// it's the pre-agent-turn checkpoint, and normal chat passes straight through
+// it. A second handler registered here at higher priority than website/
+// quick-menu's would run on every message BEFORE anyone claims it, so it
+// cannot tell "about to be claimed" from "about to go to the agent turn as
+// normal" -- deleting the placeholder there would kill the bubble immediately
+// for ordinary chat, before the agent even starts generating. A handler
+// registered at LOWER priority never runs at all for a claimed message,
+// because claiming is terminal and skips every lower-priority handler for
+// that same event, this file's included. There is no priority ordering that
+// makes a second, independent `reply_dispatch` listener in this file see "a
+// claim just happened" -- structurally not possible with this hook's
+// documented semantics, not a guess.
+//
+// So: the plugin that actually claims and delivers the reply (website,
+// quick-menu) is the only code that runs at the right moment. Rather than
+// duplicating this file's Map + Telegram delete-call logic into each of
+// those separate plugin directories (no shared import path between
+// workspace-extension plugins -- same constraint already noted below re:
+// the duplicated tg() helper), this file publishes a tiny settle function on
+// `globalThis` under a well-known `Symbol.for` key. That works because
+// OpenClaw plugins are NOT sandboxed subprocesses -- confirmed in
+// `docs/plugins/architecture.md`: "Native OpenClaw plugins run in-process
+// with the Gateway... same process-level trust boundary as core code" -- so
+// all three plugins share one JS heap and `globalThis`. This is also not a
+// novel trick: OpenClaw's own compiled source uses the exact same
+// `Symbol.for` singleton pattern internally for its plugin-commands registry
+// (`Symbol.for("openclaw.pluginCommandsState")`, reverse-engineered in
+// plugins/quick-menu/index.ts's own header). See getReplyDispatchSettler
+// below for the actual mechanism, and that same symbol's use in
+// plugins/website/index.ts and plugins/quick-menu/index.ts for the caller
+// side.
+//
 // Note: before_agent_run was tried first and never fired even once, for
 // any real message (confirmed live 08-18) -- it's gated behind
 // hooks.allowConversationAccess and something about that permission grant
@@ -174,6 +229,52 @@ async function tg(botToken: string, method: string, body: Record<string, unknown
   return json;
 }
 
+/** Well-known cross-plugin key -- see the "Fix: reply_dispatch-delivered
+ * replies" header section above for why this exists and why it's a
+ * `Symbol.for` lookup rather than an import. Must stay byte-identical to the
+ * copy of this same string in plugins/website/index.ts and
+ * plugins/quick-menu/index.ts (Symbol.for interns by exact string match). */
+const REPLY_DISPATCH_SETTLER_KEY = Symbol.for("openclaw-byok.thinking-bubble.getReplyDispatchSettler");
+
+/** Published on `globalThis` (see register() below) for website/quick-menu's
+ * own `reply_dispatch` handlers to call. Returns `undefined` if no
+ * placeholder is currently pending for this session -- nothing to settle.
+ * Otherwise returns a one-shot settle function bound to THAT SPECIFIC
+ * placeholder (captured by object reference here, not just re-looked-up by
+ * sessionKey later): calling it deletes that exact placeholder, but is a
+ * safe no-op if a newer placeholder has since replaced it in
+ * `pendingBySession` (e.g. the caller awaited a slow LLM call and a fresh
+ * message arrived on the same session in the meantime -- message_received's
+ * own orphan-handling above would already have superseded the one this
+ * caller captured). This is what stops the delete from racing a subsequent
+ * message's placeholder: the caller should grab this settler as early as
+ * possible (right after claiming, before any await) and invoke it right
+ * before sending its real reply -- the same moment reply_payload_sending
+ * deletes the placeholder in the normal path below, so the bubble stays
+ * visible for the same duration either way. */
+function getReplyDispatchSettler(sessionKey: string): (() => void) | undefined {
+  const placeholder = pendingBySession.get(sessionKey);
+  if (!placeholder) return undefined;
+
+  return () => {
+    if (pendingBySession.get(sessionKey) !== placeholder) return; // superseded, not ours to touch
+    pendingBySession.delete(sessionKey);
+
+    const botToken = process.env.THINKING_BUBBLE_BOT_TOKEN;
+    if (!botToken) return;
+
+    tg(botToken, "deleteMessage", {
+      chat_id: placeholder.chatId,
+      message_id: placeholder.messageId,
+    }).catch((err) => {
+      console.error(
+        "[thinking-bubble] failed to delete placeholder (reply_dispatch path):",
+        err instanceof Error ? err.message : String(err),
+      );
+    });
+  };
+}
+
 function extractChatId(event: Record<string, unknown>, ctx: Record<string, unknown>): string | undefined {
   const metadata = (event as { metadata?: Record<string, unknown> }).metadata ?? {};
   const candidates = [
@@ -223,6 +324,14 @@ export default definePluginEntry({
   name: "Thinking Bubble",
   description: "Send a placeholder Telegram message while a reply generates, then delete it once the real answer is about to arrive.",
   register(api) {
+    // Cross-plugin coordination point for website/quick-menu's reply_dispatch
+    // handlers -- see the "Fix: reply_dispatch-delivered replies" header
+    // section and getReplyDispatchSettler's own doc comment above. Assigning
+    // on every register() call (rather than at module load) keeps this
+    // correct even if the plugin runtime ever re-enters register() -- always
+    // points at the current pendingBySession closure, never a stale one.
+    (globalThis as Record<PropertyKey, unknown>)[REPLY_DISPATCH_SETTLER_KEY] = getReplyDispatchSettler;
+
     // Sweeps for placeholders whose owning turn never called
     // reply_payload_sending (see PLACEHOLDER_TIMEOUT_MS comment above).
     // Same shape as the website plugin's awaitingDescriptionBySessionKey

@@ -262,6 +262,29 @@ function extractProvider(event: Record<string, unknown>, ctx: Record<string, unk
   );
 }
 
+/** Cross-plugin coordination key thinking-bubble/index.ts publishes on
+ * `globalThis` -- see that file's "Fix: reply_dispatch-delivered replies"
+ * header section and its `getReplyDispatchSettler` doc comment for the full
+ * reasoning (reply_dispatch's claim-is-terminal semantics rule out
+ * thinking-bubble registering its own reply_dispatch handler for this, and
+ * there's no import path between separate workspace-extension plugin
+ * directories). Must stay byte-identical to that file's copy of the same
+ * string (Symbol.for interns by exact string match) and to
+ * plugins/website/index.ts's copy. */
+const THINKING_BUBBLE_SETTLER_KEY = Symbol.for("openclaw-byok.thinking-bubble.getReplyDispatchSettler");
+
+/** Looks up thinking-bubble's settle function by the well-known symbol above
+ * and calls it for this session, if present. Safe no-op if thinking-bubble
+ * isn't loaded/enabled (lookup misses) or has no placeholder pending for
+ * this session (the inner call returns undefined) -- callers use this as
+ * `getThinkingBubbleSettler(sessionKey)?.()`. */
+function getThinkingBubbleSettler(sessionKey: string): (() => void) | undefined {
+  const getSettler = (globalThis as Record<PropertyKey, unknown>)[THINKING_BUBBLE_SETTLER_KEY] as
+    | ((sessionKey: string) => (() => void) | undefined)
+    | undefined;
+  return typeof getSettler === "function" ? getSettler(sessionKey) : undefined;
+}
+
 /** `reply_dispatch`'s event carries a `FinalizedMsgContext` (confirmed against
  * this deployed OpenClaw version's own `src/auto-reply/templating.ts`), a
  * completely different shape from `message_received`'s event/ctx pair above
@@ -360,9 +383,18 @@ async function bulkDeleteMessages(botToken: string, chatId: string, ids: number[
   }
 }
 
-async function performClearChat(botToken: string, chatId: string): Promise<void> {
+async function performClearChat(
+  botToken: string,
+  chatId: string,
+  settleThinkingBubble?: () => void,
+): Promise<void> {
   let newest: number | undefined;
   try {
+    // Delete the thinking-bubble placeholder right before the real
+    // confirmation is sent as a fresh message -- same timing thinking-bubble's
+    // own reply_payload_sending path uses for the normal agent-turn case. See
+    // getThinkingBubbleSettler above for why this is a globalThis lookup.
+    settleThinkingBubble?.();
     const sent = await tg(botToken, "sendMessage", {
       chat_id: chatId,
       text: CLEARCHAT_TEXT,
@@ -445,10 +477,18 @@ export default definePluginEntry({
         const chatId = resolveReplyDispatchChatId(finalizedCtx);
         if (!chatId) return;
 
+        // Captured now, before onReplyStart/performClearChat -- see
+        // getReplyDispatchSettler's doc comment in thinking-bubble's
+        // index.ts for why "early capture, late invoke" is what makes this
+        // safe against a newer placeholder replacing this one in the
+        // meantime.
+        const sessionKey = event.sessionKey ?? (finalizedCtx as { SessionKey?: string }).SessionKey;
+        const settleThinkingBubble = sessionKey ? getThinkingBubbleSettler(sessionKey) : undefined;
+
         if (ctx.onReplyStart) await ctx.onReplyStart();
 
         try {
-          await performClearChat(botToken, chatId);
+          await performClearChat(botToken, chatId, settleThinkingBubble);
         } catch (err) {
           console.error("[quick-menu] clearchat: unexpected failure:", err instanceof Error ? err.message : String(err));
         }

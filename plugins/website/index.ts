@@ -660,6 +660,27 @@ async function tg(botToken, method, body) {
   return json;
 }
 
+/** Cross-plugin coordination key thinking-bubble/index.ts publishes on
+ * `globalThis` -- see that file's "Fix: reply_dispatch-delivered replies"
+ * header section and its `getReplyDispatchSettler` doc comment for the full
+ * reasoning (reply_dispatch's claim-is-terminal semantics rule out
+ * thinking-bubble registering its own reply_dispatch handler for this, and
+ * there's no import path between separate workspace-extension plugin
+ * directories). Must stay byte-identical to that file's copy of the same
+ * string (Symbol.for interns by exact string match) and to
+ * plugins/quick-menu/index.ts's copy. */
+const THINKING_BUBBLE_SETTLER_KEY = Symbol.for("openclaw-byok.thinking-bubble.getReplyDispatchSettler");
+
+/** Looks up thinking-bubble's settle function by the well-known symbol above
+ * and calls it for this session, if present. Safe no-op if thinking-bubble
+ * isn't loaded/enabled (lookup misses) or has no placeholder pending for
+ * this session (the inner call returns undefined) -- callers use this as
+ * `getThinkingBubbleSettler(sessionKey)?.()`. */
+function getThinkingBubbleSettler(sessionKey) {
+  const getSettler = globalThis[THINKING_BUBBLE_SETTLER_KEY];
+  return typeof getSettler === "function" ? getSettler(sessionKey) : undefined;
+}
+
 /** `reply_dispatch`'s event carries a `FinalizedMsgContext` (confirmed
  * against this deployed OpenClaw version's own `src/auto-reply/
  * templating.ts`) -- a different shape from `message_received`'s event/ctx
@@ -831,11 +852,21 @@ export default definePluginEntry({
           return;
         }
 
+        // Captured now, before generateHtml()'s (possibly slow) LLM call --
+        // see getReplyDispatchSettler's doc comment in thinking-bubble's
+        // index.ts for why "early capture, late invoke" is what makes this
+        // safe against a newer placeholder replacing this one mid-generation.
+        const settleThinkingBubble = getThinkingBubbleSettler(sessionKey);
+
         if (ctx.onReplyStart) await ctx.onReplyStart();
 
         try {
           const html = await generateHtml(llm, text);
           const published = await publishForSession(sessionKey, html, text.slice(0, 80));
+          // Delete the placeholder right before the real answer is sent as a
+          // fresh message -- same timing thinking-bubble's own
+          // reply_payload_sending path uses for the normal agent-turn case.
+          settleThinkingBubble?.();
           await tg(botToken, "sendMessage", {
             chat_id: chatId,
             text: `${published.reused ? "Website updated" : "Website published"}: ${published.url}`,
@@ -843,6 +874,11 @@ export default definePluginEntry({
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           try {
+            // A real reply (the error text) is still about to be delivered
+            // via reply_dispatch, so the placeholder settles here too --
+            // otherwise the 3-minute safety net would eventually replace it
+            // with a misleading "didn't come through" next to this error.
+            settleThinkingBubble?.();
             await tg(botToken, "sendMessage", {
               chat_id: chatId,
               text: `Couldn't build that page: ${message}`,
