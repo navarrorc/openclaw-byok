@@ -382,11 +382,11 @@ just call it again with updated HTML rather than asking to "close" first.
 Call `close_website` when the user says they're done with it or asks to
 close it.
 
-Make it look like a real product, not a bare unstyled page — consult the
-`website-design` skill for the full design system (theme choice, DaisyUI
-components, visual-quality checklist). At minimum, every page you publish
-must include the Tailwind + DaisyUI CDN tags and this layout-safety CSS in
-`<head>`:
+Make it look like a real product, not a bare unstyled page — the full
+design system (theme choice, DaisyUI components, visual-quality checklist)
+is already provided in your instructions, no need to look anything up
+first. At minimum, every page you publish must include the Tailwind +
+DaisyUI CDN tags and this layout-safety CSS in `<head>`:
 
 ```html
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
@@ -1094,29 +1094,29 @@ const TUNNEL_STARTUP_TIMEOUT_MS = 20_000;
 const CLOUDFLARED_PATH = "/data/bin/cloudflared";
 
 /** The `website-design` skill, shipped alongside this plugin (declared via
- * `"skills": ["./skills"]` in openclaw.plugin.json) so OpenClaw's normal
- * skill-discovery makes it available to the *main agent turn* -- the path
- * `publish_website` itself is reached through (the agent generates HTML
- * itself, per AGENTS.md's addendum, then calls the tool with it; the tool
- * handler here never talks to the LLM at all).
+ * `"skills": ["./skills"]` in openclaw.plugin.json, "always": true in its
+ * own frontmatter) so it's always name-discoverable in the compact
+ * `<available_skills>` entry every turn gets.
  *
- * Confirmed against this deployed version's own docs/tools/skills.md:
- * skill *bodies* are not unconditionally injected into every turn's system
- * prompt -- only a compact name/description/location entry is, per skill,
- * every turn ("Token impact" section: ~97 chars + field lengths, not full
- * body size). Full instructions load "after trigger" (progressive
- * disclosure, the same AgentSkills spec OpenClaw says it follows). That's a
- * real, live mechanism for the agent-turn path, but not a hard guarantee
- * this exact skill gets read before every single generation.
- *
- * The two paths that bypass the agent turn entirely -- generateHtml() below,
- * used by the /website fast path and the reply_dispatch claimed-follow-up
- * handler -- call a low-level `llm.complete()` primitive directly and get
- * NO system-prompt-building, hence no skill injection of any kind (compact
- * or full). For those, this same file is read directly at request time
- * (loadDesignGuidance below) and its body interpolated straight into the
- * completion's systemPrompt -- a real, code-level "by construction"
- * guarantee that doesn't depend on the model choosing to consult a skill. */
+ * Its FULL BODY is no longer relied on to reach the main agent turn (the
+ * path `publish_website` itself is reached through: the agent generates
+ * HTML itself, per AGENTS.md's addendum, then calls the tool with it -- the
+ * tool handler here never talks to the LLM at all) via progressive-
+ * disclosure skill discovery. That mechanism was live-measured (08-19) to
+ * cost a real, unconditional round trip on a cold session: agent turn 1
+ * decides to `read` the skill file, turn 2 (only after that result comes
+ * back) finally decides to call `publish_website` -- a ~7s gap between the
+ * two tool-call dispatch timestamps in the same run, before any real page
+ * content gets generated. See the `before_prompt_build` hook registered in
+ * register() below for the fix: this file is now read directly at request
+ * time (loadDesignGuidance below) for THREE call sites, not two -- that
+ * hook (main agent-turn path), generateHtml() (/website fast path), and the
+ * reply_dispatch claimed-follow-up handler -- one file, one read function,
+ * no copy to drift, and no agent-side discovery step required for any of
+ * them. The skill declaration stays (cheap, and keeps the compact entry
+ * available in case a future turn wants to `read` it explicitly for some
+ * reason), it's just no longer load-bearing for getting the full body in
+ * front of the model before it generates. */
 const SKILL_PATH = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "skills",
@@ -1475,7 +1475,56 @@ const WEBSITE_INTRO =
 
 /** Shared by the fast path (/website <description> in one message) and the
  * claimed-follow-up path (reply_dispatch below): turn a description into
- * raw HTML via whichever llm.complete() the caller has access to. */
+ * raw HTML via whichever llm.complete() the caller has access to.
+ *
+ * --- Prompt caching investigation (08-19), UPDATED with live results ---
+ *
+ * The design guidance folded into systemPrompt above is large (~4.7KB,
+ * ~1,150 tokens) and byte-identical on every single call, so in principle
+ * this is exactly the shape Gemini's *implicit* caching wants -- on by
+ * default for Gemini 2.5+ models, zero client-side setup, and Google's own
+ * guidance is "keep the content at the beginning of the request the same."
+ *
+ * - OpenClaw's plugin-SDK `llm.complete()` has a typed `cacheRetention`
+ *   option, but it's dead for this transport -- confirmed by reading the
+ *   real shipped transport code: `buildGoogleGenerativeAiParams` never
+ *   reads it. The actual Gemini *explicit* cache create/manage path
+ *   (`cachedContents`) exists in this OpenClaw build but only for the
+ *   embedded agent-turn runner's own session pipeline, with zero plugin
+ *   entry point -- a plugin would have to bypass the SDK and hand-roll
+ *   Gemini's raw `cachedContents` REST lifecycle itself to get *explicit*
+ *   caching. Not done here: substantially bigger, riskier engineering than
+ *   what follows shows is actually justified.
+ * - The `before_prompt_build` hook above originally used
+ *   `appendSystemContext`, which -- traced through this build's own
+ *   `composeSystemPromptWithHookContext` -- lands AFTER the per-turn
+ *   variable base system prompt, not before it, defeating the whole
+ *   "stable prefix" premise. Fixed to `prependSystemContext`, which this
+ *   build's own code confirms puts it first, ahead of everything variable.
+ * - With that fix live, ran 7 real `openclaw agent --local` calls against
+ *   this deployed box (4 pre-fix, 3 post-fix, spanning a cold-cache
+ *   container restart and immediate back-to-back repeats) -- every single
+ *   one logged `cacheRead: 0` in the real Gemini `usageMetadata`
+ *   (`cachedContentTokenCount`, read directly off the wire by this build's
+ *   `updateUsage()` in the google transport, not something our code could
+ *   fake even if it tried). Prefix was correctly positioned, well over the
+ *   documented 1,024-token minimum, and byte-identical across calls --
+ *   implicit caching still never engaged, empirically, in this
+ *   environment.
+ * - Conclusion: implicit caching is real but opaque and best-effort on
+ *   Google's side -- it depends on backend cache state this low-volume
+ *   BYOK single-tenant sandbox (occasional requests, minutes apart, no
+ *   sustained QPS to keep a shard's cache warm) has no way to influence or
+ *   guarantee, and OpenClaw exposes no plugin-level lever to force it
+ *   (`cacheRetention` is dead for this transport, `cachedContents` has no
+ *   plugin entry point). Given that, this is genuinely NOT achievable as a
+ *   reliable, verifiable win from the plugin side right now -- reporting
+ *   it as such rather than leaving it an unverified assumption. What *is*
+ *   real and shipped: the request is now correctly shaped for caching
+ *   (prefix position fixed) if Google's infra ever does warm up for this
+ *   traffic pattern, and `usage.cacheRead` is logged on every call so a
+ *   hit becomes visible the moment one happens, instead of being silently
+ *   assumed either way. */
 async function generateHtml(llm, description) {
   const completion = await llm.complete({
     messages: [{ role: "user", content: description }],
@@ -1484,6 +1533,10 @@ async function generateHtml(llm, description) {
     maxTokens: 8192,
     temperature: 0.4,
   });
+  const cacheRead = completion.usage?.cacheRead ?? 0;
+  console.log(
+    `[website] generateHtml usage: input=${completion.usage?.input ?? "?"} cacheRead=${cacheRead} output=${completion.usage?.output ?? "?"}`,
+  );
   return stripCodeFence(completion.text ?? "");
 }
 
@@ -1567,6 +1620,60 @@ export default definePluginEntry({
         }
         sessionKeyByToolCallId.set(event.toolCallId, ctx?.sessionKey ?? "global");
       }
+    });
+
+    // --- Killing the skill-read round-trip (08-19) ---
+    //
+    // Confirmed real via `PluginHookBeforePromptBuildResult` in this
+    // deployed version's own shipped `.d.ts` (not guessed from the docs
+    // alone): `before_prompt_build` fires before every agent turn's system
+    // prompt is built and can return `prependSystemContext`/
+    // `appendSystemContext`, whose doc comments both say the same thing --
+    // "so providers can cache it (e.g. prompt caching). Use for static
+    // plugin guidance instead of prependContext/appendContext to avoid
+    // per-turn token cost."
+    //
+    // Started with `appendSystemContext`, then live-measured (08-19, 4
+    // consecutive real `openclaw agent --local` calls against this
+    // deployed box) that it produced `cacheRead: 0` every single time
+    // despite a stable ~5KB guidance block on every turn. Traced the real
+    // cause by reading this build's own shipped
+    // `composeSystemPromptWithHookContext` (attempt.thread-helpers-*.js):
+    // it joins the request as `[prependSystem, baseSystemPrompt,
+    // appendSystem]` -- so `appendSystemContext` lands AFTER the base
+    // system prompt (tool defs, AGENTS.md, current date/time, session
+    // state), which varies turn to turn. Gemini's implicit caching keys
+    // off a stable prefix at the very START of the request (see
+    // generateHtml() below); putting the static block at the *end* means
+    // the actual prefix the cache would need to match is the *variable*
+    // part, so it can never hit. `prependSystemContext` puts it first,
+    // ahead of all per-turn-variable content -- the shape caching actually
+    // needs. This is a real fix for a real bug in the first version of
+    // this hook, not a guess: same call sites, same guidance text, just
+    // moved to the position that makes the cache-worthy prefix actually
+    // stable.
+    //
+    // This reuses loadDesignGuidance() unchanged -- the exact same read
+    // that already feeds generateHtml()'s systemPrompt for the /website
+    // fast path and the reply_dispatch follow-up -- so all three call sites
+    // share one source of truth. The agent no longer has any reason to
+    // issue a `read` tool call for the skill body before calling
+    // `publish_website`: the guidance is already in front of it when it
+    // decides whether to build a page at all (confirmed live -- see
+    // generateHtml() below for the full caching investigation and its
+    // results).
+    //
+    // Registered for every turn of the agent this plugin is loaded into
+    // (there's no cheaper per-turn way to know in advance whether *this*
+    // turn will end up building a page -- that's the same reason the
+    // model needed a skill-read before, just moved earlier), which is a
+    // real, small, ongoing prompt-size cost (loadDesignGuidance()'s body,
+    // ~5KB) traded for eliminating the round trip on every turn that does
+    // end up calling `publish_website`.
+    api.on("before_prompt_build", async () => {
+      const guidance = loadDesignGuidance();
+      if (!guidance) return;
+      return { prependSystemContext: guidance };
     });
 
     // Claims the next plain-text message after a bare `/website` as the
