@@ -191,6 +191,86 @@ const COOKIE_NAME = "website_k";
 const TUNNEL_URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
 const TUNNEL_STARTUP_TIMEOUT_MS = 20_000;
 
+/** --- 08-19 hang incident: root cause and fix ---
+ *
+ * A real follow-up request ("list of all the skulls in halo campaign
+ * evolve...") got stuck with NO resolution at all -- not even the
+ * thinking-bubble 3-minute stuck-placeholder safety net cleared it. Traced
+ * live against root@2.29.7.145 with a diagnostic probe script that called
+ * this file's own real `publish_website` tool handler (real spawn, real
+ * cloudflared, real tunnel) directly: createSite()/waitForTunnelUrl()
+ * resolved reliably in ~5-8s across 6 real runs, and the still-running
+ * orphaned `cloudflared` process left over from the stuck request had an
+ * ESTABLISHED TCP connection to Cloudflare's edge (confirmed via `ss -tnp`
+ * inside the container) -- strong evidence the tunnel itself came up fine
+ * and TUNNEL_STARTUP_TIMEOUT_MS never needed to fire.
+ *
+ * The real bottleneck: `tg()` below built its `fetch()` call with NO
+ * timeout/AbortSignal at all. Confirmed live on this exact box that this
+ * is a real, reachable hang, not a hypothetical: a `fetch()` with no signal
+ * against a socket that accepts the TCP connection but never writes a
+ * response was STILL PENDING 15 SECONDS later (undici's own documented
+ * default is a 300-second/5-minute `headersTimeout`, which is not a
+ * bound this product's "reasonable time" requirement can rely on, and
+ * this incident had already run well past 12 minutes with zero
+ * console.error ever printed from either of this handler's own catch
+ * blocks -- meaning execution was still suspended mid-`await`, not
+ * thrown). `reply_dispatch` handlers have no default timeout of their
+ * own either (confirmed against this deployed version's own
+ * `src/plugins/hooks.ts` `DEFAULT_MODIFYING_HOOK_TIMEOUT_MS_BY_HOOK`
+ * table, and its `dispatch-from-config.ts` caller, which plainly
+ * `await`s the handler with no race against a timer -- only against an
+ * external abort signal that nothing here ever fires), so a hang inside
+ * this file's own `reply_dispatch` handler is a hang OpenClaw's core has
+ * no mechanism to ever rescue.
+ *
+ * Fix: give every `tg()` call its own hard ceiling via
+ * `AbortSignal.timeout()` (turns an indefinite stall into a normal
+ * rejected promise, same shape as every other failure this file already
+ * handles), and wrap the reply_dispatch handler's real work (generate +
+ * publish + deliver) in one more outer ceiling as a second, independent
+ * backstop -- see REPLY_DISPATCH_WORK_TIMEOUT_MS below. Between the two,
+ * nothing in this handler can hang past a bounded, known ceiling again.
+ *
+ * This also explains why the thinking-bubble safety net didn't fire as a
+ * last resort (a real, separate bug, not just a consequence of the hang
+ * above): this handler used to call `getThinkingBubbleSettler(sessionKey)
+ * ?.()` -- which synchronously deletes thinking-bubble's own
+ * `pendingBySession` tracking entry -- BEFORE `await`ing the final
+ * `tg(sendMessage)` call that actually delivers the answer. The instant
+ * that call started hanging, thinking-bubble's own bookkeeping already
+ * believed this placeholder was resolved, so its 3-minute sweep had
+ * nothing left to find -- not because the sweep is broken, but because it
+ * was told (prematurely) that there was nothing to sweep. Fixed below by
+ * only settling the placeholder once a reply (success or the caught-error
+ * notice) has actually been delivered -- if even the error notice fails to
+ * send, the placeholder is deliberately left tracked so the safety net
+ * remains the true last resort. */
+const TG_FETCH_TIMEOUT_MS = 15_000;
+
+/** Second, independent backstop on top of TG_FETCH_TIMEOUT_MS and
+ * TUNNEL_STARTUP_TIMEOUT_MS -- bounds the reply_dispatch handler's entire
+ * generate+publish+deliver sequence so that no single step (including one
+ * this file doesn't itself put an explicit ceiling on, like the LLM call
+ * inside generateHtml) can hang the handler indefinitely, even one we
+ * haven't specifically identified. Generous on purpose: real generation of
+ * a substantial page plus tunnel startup (up to TUNNEL_STARTUP_TIMEOUT_MS)
+ * plus Telegram delivery (up to TG_FETCH_TIMEOUT_MS), summed with margin. */
+const REPLY_DISPATCH_WORK_TIMEOUT_MS = 90_000;
+
+/** Turns any promise that doesn't settle within `ms` into a rejection with
+ * a clear, labeled message -- see the header comment above for why this
+ * exists. `timer.unref()` so a pending guard can't itself keep the process
+ * alive if everything else has already shut down. */
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /** Persistent path under the /data volume, installed there by setup.sh --
  * NOT /usr/local/bin (container writable layer, wiped on every
  * --force-recreate). See header comment for the incident this fixes. */
@@ -652,6 +732,7 @@ async function tg(botToken, method, body) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(TG_FETCH_TIMEOUT_MS),
   });
   const json = await res.json().catch(() => ({}));
   if (!json.ok) {
@@ -852,37 +933,61 @@ export default definePluginEntry({
           return;
         }
 
-        // Captured now, before generateHtml()'s (possibly slow) LLM call --
-        // see getReplyDispatchSettler's doc comment in thinking-bubble's
-        // index.ts for why "early capture, late invoke" is what makes this
-        // safe against a newer placeholder replacing this one mid-generation.
-        const settleThinkingBubble = getThinkingBubbleSettler(sessionKey);
-
+        // NOT captured here (that was the bug, fixed 08-19). The old
+        // "capture getThinkingBubbleSettler() early, before the slow LLM
+        // call" approach assumed thinking-bubble's own placeholder already
+        // exists in pendingBySession by the time reply_dispatch fires for
+        // the SAME inbound message. Real evidence (both hooks' DIAG logs
+        // on one real Telegram exchange, 08-19) proved that's false:
+        // reply_dispatch can reach this point ~40ms after the inbound
+        // message, while thinking-bubble's own placeholder send is a real
+        // Telegram API round-trip that took ~790ms to complete and land in
+        // pendingBySession -- reply_dispatch was checking an empty map.
+        // Fix: look the settler up FRESH at each point it's actually
+        // invoked, after generateHtml()'s multi-second LLM call has had
+        // plenty of time to let thinking-bubble's sub-second placeholder
+        // send finish first. getReplyDispatchSettler's own superseded-check
+        // (comparing object identity in pendingBySession) still protects
+        // against a newer placeholder arriving in between regardless of
+        // when the lookup happens, so there's no correctness cost to
+        // deferring it -- only a race removed.
         if (ctx.onReplyStart) await ctx.onReplyStart();
 
         try {
-          const html = await generateHtml(llm, text);
-          const published = await publishForSession(sessionKey, html, text.slice(0, 80));
-          // Delete the placeholder right before the real answer is sent as a
-          // fresh message -- same timing thinking-bubble's own
-          // reply_payload_sending path uses for the normal agent-turn case.
-          settleThinkingBubble?.();
-          await tg(botToken, "sendMessage", {
-            chat_id: chatId,
-            text: `${published.reused ? "Website updated" : "Website published"}: ${published.url}`,
-          });
+          await withTimeout(
+            (async () => {
+              const html = await generateHtml(llm, text);
+              const published = await publishForSession(sessionKey, html, text.slice(0, 80));
+              await tg(botToken, "sendMessage", {
+                chat_id: chatId,
+                text: `${published.reused ? "Website updated" : "Website published"}: ${published.url}`,
+              });
+            })(),
+            REPLY_DISPATCH_WORK_TIMEOUT_MS,
+            "website follow-up",
+          );
+          // Delete the placeholder right after the real answer is actually
+          // sent -- NOT before (that was the 08-19 bug: settling here
+          // first, then hanging on the send, left thinking-bubble's own
+          // safety net believing there was nothing left to sweep). Same
+          // timing thinking-bubble's own reply_payload_sending path uses
+          // for the normal agent-turn case.
+          getThinkingBubbleSettler(sessionKey)?.();
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           try {
-            // A real reply (the error text) is still about to be delivered
-            // via reply_dispatch, so the placeholder settles here too --
-            // otherwise the 3-minute safety net would eventually replace it
-            // with a misleading "didn't come through" next to this error.
-            settleThinkingBubble?.();
             await tg(botToken, "sendMessage", {
               chat_id: chatId,
               text: `Couldn't build that page: ${message}`,
             });
+            // A real reply (the error text) made it out, so settle here too
+            // -- otherwise the 3-minute safety net would eventually replace
+            // it with a misleading "didn't come through" next to this
+            // error. If this send ALSO fails/hangs (bounded now by
+            // TG_FETCH_TIMEOUT_MS either way), deliberately leave the
+            // placeholder tracked -- the safety net is the true last resort
+            // when we couldn't tell the user anything at all.
+            getThinkingBubbleSettler(sessionKey)?.();
           } catch (sendErr) {
             console.error(
               "[website] failed to report generation error to chat:",
@@ -931,7 +1036,11 @@ export default definePluginEntry({
         // failure mode from this tool's point of view). Report it as a
         // normal failed tool call instead.
         try {
-          const { url, reused } = await publishForSession(sessionKey, html, title);
+          const { url, reused } = await withTimeout(
+            publishForSession(sessionKey, html, title),
+            REPLY_DISPATCH_WORK_TIMEOUT_MS,
+            "publishForSession",
+          );
           return {
             content: [{ type: "text", text: `${reused ? "Website updated" : "Website published"}: ${url}` }],
             details: { url, reused },
@@ -1023,7 +1132,7 @@ export default definePluginEntry({
 
         let html;
         try {
-          html = await generateHtml(llm, description);
+          html = await withTimeout(generateHtml(llm, description), REPLY_DISPATCH_WORK_TIMEOUT_MS, "generateHtml");
         } catch (err) {
           return {
             text: `Couldn't generate that page: ${err instanceof Error ? err.message : String(err)}`,
@@ -1033,7 +1142,11 @@ export default definePluginEntry({
 
         let published;
         try {
-          published = await publishForSession(sessionKey, html, description.slice(0, 80));
+          published = await withTimeout(
+            publishForSession(sessionKey, html, description.slice(0, 80)),
+            REPLY_DISPATCH_WORK_TIMEOUT_MS,
+            "publishForSession",
+          );
         } catch (err) {
           return {
             text: `Generated the page but couldn't publish it: ${err instanceof Error ? err.message : String(err)}`,

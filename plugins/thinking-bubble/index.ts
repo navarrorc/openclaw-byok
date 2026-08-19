@@ -189,6 +189,16 @@ const PLACEHOLDER_TIMEOUT_MS = 3 * 60 * 1000;
 
 const STUCK_PLACEHOLDER_TEXT = "That one didn't come through -- try sending it again.";
 
+/** See plugins/website/index.ts's 08-19 "hang incident: root cause and fix"
+ * header comment for the full story -- this file's `tg()` had the exact
+ * same unbounded-`fetch()` shape, so its own `editMessageText` call inside
+ * settleStuckPlaceholder (the last-resort safety net itself!) could
+ * silently hang the same way, defeating the one mechanism this file exists
+ * to guarantee. Must stay in sync with the copies of this same constant in
+ * plugins/website/index.ts and plugins/quick-menu/index.ts (independent
+ * copies -- no shared import path between workspace-extension plugins). */
+const TG_FETCH_TIMEOUT_MS = 15_000;
+
 /** Edits a placeholder that's being abandoned (past its timeout, or
  * superseded by a new message on the same session) into a plain retry
  * notice, and swallows/logs failure the same way every other Telegram call
@@ -217,6 +227,7 @@ async function tg(botToken: string, method: string, body: Record<string, unknown
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(TG_FETCH_TIMEOUT_MS),
   });
   const json = (await res.json().catch(() => ({}))) as {
     ok?: boolean;

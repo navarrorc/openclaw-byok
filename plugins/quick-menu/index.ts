@@ -223,11 +223,21 @@ function isClearChatCommand(content: string): boolean {
 const START_KEYBOARD_TEXT = "👋 Quick menu ready -- tap the icon beside the message box anytime.";
 const NEW_KEYBOARD_TEXT = "🆕 Fresh session -- quick menu ready.";
 
+/** See plugins/website/index.ts's 08-19 "hang incident: root cause and fix"
+ * header comment for the full story -- this file's `tg()` had the exact
+ * same unbounded-`fetch()` shape, and /clearchat's performClearChat below
+ * had the same settle-before-send ordering bug. Must stay in sync with the
+ * copies of this same constant in plugins/website/index.ts and
+ * plugins/thinking-bubble/index.ts (independent copies -- no shared import
+ * path between workspace-extension plugins). */
+const TG_FETCH_TIMEOUT_MS = 15_000;
+
 async function tg(botToken: string, method: string, body: Record<string, unknown>) {
   const res = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(TG_FETCH_TIMEOUT_MS),
   });
   const json = (await res.json().catch(() => ({}))) as { ok?: boolean; description?: string };
   if (!json.ok) {
@@ -386,23 +396,33 @@ async function bulkDeleteMessages(botToken: string, chatId: string, ids: number[
 async function performClearChat(
   botToken: string,
   chatId: string,
-  settleThinkingBubble?: () => void,
+  sessionKey?: string,
 ): Promise<void> {
   let newest: number | undefined;
   try {
-    // Delete the thinking-bubble placeholder right before the real
-    // confirmation is sent as a fresh message -- same timing thinking-bubble's
-    // own reply_payload_sending path uses for the normal agent-turn case. See
-    // getThinkingBubbleSettler above for why this is a globalThis lookup.
-    settleThinkingBubble?.();
     const sent = await tg(botToken, "sendMessage", {
       chat_id: chatId,
       text: CLEARCHAT_TEXT,
       reply_markup: QUICK_MENU_KEYBOARD,
     });
     newest = (sent as { result?: { message_id?: number } }).result?.message_id;
+    // Delete the thinking-bubble placeholder right AFTER the real
+    // confirmation is actually sent, not before -- see website/index.ts's
+    // 08-19 "hang incident" header comment for the real bug this ordering
+    // fixes (settling first, then hanging/failing on the send, leaves
+    // thinking-bubble's own 3-minute safety net believing there's nothing
+    // left to sweep even though the user got nothing). Looked up FRESH
+    // here, not captured before this function was called -- see that same
+    // header's "Fix (round 3)" note for the separate race that avoids (this
+    // hook can reach this point before thinking-bubble's own async
+    // placeholder send has landed in its map). See getThinkingBubbleSettler
+    // above for why this is a globalThis lookup.
+    if (sessionKey) getThinkingBubbleSettler(sessionKey)?.();
   } catch (err) {
     console.error("[quick-menu] clearchat: failed to send confirmation:", err instanceof Error ? err.message : String(err));
+    // Deliberately leave the placeholder tracked if sessionKey is set --
+    // the 3-minute safety net is the true last resort when we couldn't
+    // tell the user anything at all.
     return;
   }
 
@@ -477,18 +497,12 @@ export default definePluginEntry({
         const chatId = resolveReplyDispatchChatId(finalizedCtx);
         if (!chatId) return;
 
-        // Captured now, before onReplyStart/performClearChat -- see
-        // getReplyDispatchSettler's doc comment in thinking-bubble's
-        // index.ts for why "early capture, late invoke" is what makes this
-        // safe against a newer placeholder replacing this one in the
-        // meantime.
         const sessionKey = event.sessionKey ?? (finalizedCtx as { SessionKey?: string }).SessionKey;
-        const settleThinkingBubble = sessionKey ? getThinkingBubbleSettler(sessionKey) : undefined;
 
         if (ctx.onReplyStart) await ctx.onReplyStart();
 
         try {
-          await performClearChat(botToken, chatId, settleThinkingBubble);
+          await performClearChat(botToken, chatId, sessionKey);
         } catch (err) {
           console.error("[quick-menu] clearchat: unexpected failure:", err instanceof Error ? err.message : String(err));
         }
